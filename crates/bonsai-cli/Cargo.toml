@@ -1,0 +1,11 @@
+[package]
+name = "bonsai-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+bonsai-candle = { path = "../bonsai-candle" }
+clap = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }

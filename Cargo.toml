@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "crates/bonsai-candle",
+    "crates/bonsai-cli",
+    "vendor/candle/candle-core",
+    "vendor/candle/candle-metal-kernels",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.10.2"
+edition = "2021"
+description = "Minimalist ML framework."
+repository = "https://github.com/huggingface/candle"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+accelerate-src = { version = "0.3.2" }
+anyhow = { version = "1", features = ["backtrace"] }
+byteorder = "1.4.3"
+candle = { path = "./vendor/candle/candle-core", package = "candle-core", version = "0.10.2" }
+candle-metal-kernels = { path = "./vendor/candle/candle-metal-kernels", version = "0.10.2" }
+candle-nn = { version = "0.10.2" }
+candle-transformers = { version = "0.10.2" }
+clap = { version = "4.5.49", features = ["derive"] }
+criterion = { version = "0.8", default-features = false }
+fancy-regex = "0.17.0"
+float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
+gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
+libc = { version = "0.2.147" }
+libm = { version = "0.2.15" }
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+minijinja = { version = "2.12.0", features = ["builtins", "json"] }
+minijinja-contrib = { version = "2.17.1", features = ["pycompat"] }
+num_cpus = "1.15.0"
+num-traits = "0.2.15"
+objc2-foundation = { version = "0.3.1" }
+objc2-metal = { version = "0.3.1" }
+rand = "0.9.0"
+rand_distr = "0.5.1"
+rayon = "1.7.0"
+safetensors = "0.7.0"
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
+serde_plain = "1.0.2"
+thiserror = "2"
+tokenizers = { version = "0.22.0", default-features = false }
+tracing = "0.1.37"
+yoke = { version = "0.8.1", features = ["derive"] }
+zip = { version = "7.2.0", default-features = false }
+
+[patch.crates-io]
+candle-core = { path = "./vendor/candle/candle-core" }
+candle-metal-kernels = { path = "./vendor/candle/candle-metal-kernels" }
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

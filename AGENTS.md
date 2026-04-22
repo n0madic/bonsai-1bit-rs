@@ -1,0 +1,277 @@
+# AGENTS.md
+
+## What This Repo Contains
+
+This workspace is a native Rust inference port for Bonsai models built on top of Candle. The candle-core and candle-metal-kernels crates are vendored and patched; candle-nn and candle-transformers come from crates.io with candle-core overridden via `[patch.crates-io]`.
+
+Current intended path:
+
+- load either a Bonsai GGUF file (`Bonsai-1.7B.gguf`, `Bonsai-8B.gguf`) or a
+  HuggingFace/MLX directory (e.g. `prism-ml/Ternary-Bonsai-8B-mlx-2bit`)
+- run inference on `CPU` for both, or `Metal` for GGUF
+- use Candle-native GGUF loading / safetensors loading, tokenizer loading,
+  sampling, and streaming output
+
+Important constraints:
+
+- this is inference-only
+- two quantization formats are supported:
+  - GGUF dtype `Q1_0_g128` — binary {−d, +d}, 1 bit/weight, block 128 (CPU + Metal)
+  - runtime-only dtype `Q2MLX` — MLX 2-bit affine `w = scale·q + bias`
+    (q ∈ {0,1,2,3}), group 128, loaded from MLX safetensors (CPU + Metal)
+- architecture for both is Qwen3 with YaRN rope scaling
+
+## Workspace Layout
+
+- `Cargo.toml`
+  - root workspace manifest
+  - pins all workspace dependencies
+  - points `candle` and `candle-metal-kernels` to `vendor/candle/...`
+  - pulls `candle-nn` and `candle-transformers` from crates.io `0.10.2`
+  - `[patch.crates-io]` redirects `candle-core` and `candle-metal-kernels` to vendor so upstream crates use the patched versions
+- `crates/bonsai-candle`
+  - library crate
+  - owns model loading, prompt rendering, token streaming, sampling, repeat control, and generation stats
+  - contains the Qwen3/Bonsai model implementation with YaRN rope scaling (`src/qwen3.rs`)
+  - contains `ConcatKvCache` (`src/kv_cache.rs`) and `LogitsProcessor`/`Sampling` (`src/generation.rs`)
+- `crates/bonsai-cli`
+  - CLI wrapper over `bonsai-candle`
+  - accepts either `--prompt` or `--messages-file`
+  - prints streamed generation plus final stats
+- `vendor/candle`
+  - contains only `candle-core` and `candle-metal-kernels`
+  - do not assume upstream Candle has these patches
+
+## Core Rust Components
+
+### `bonsai-candle`
+
+Main responsibilities:
+
+- choose device via `DevicePreference`
+- load GGUF and tokenizer from the model file
+- use `crate::qwen3::ModelWeights` (local copy with YaRN support)
+- render chat prompts from GGUF `tokenizer.chat_template`
+- stream generated text to a writer
+- collect `prompt_tokens`, `generated_tokens`, `prompt_tps`, `generation_tps`, and `peak_memory`
+- reduce loops with:
+  - `repeat_penalty`
+  - `repeat_last_n`
+  - `no_repeat_ngram_size`
+
+Local modules (not from candle-transformers):
+
+- `src/qwen3.rs` — quantized Qwen3 model with YaRN rope scaling; adapted from candle-transformers with extended context support
+- `src/kv_cache.rs` — `ConcatKvCache` using `Tensor::cat` for Metal/CUDA-optimized KV cache
+- `src/generation.rs` — `LogitsProcessor` and `Sampling` enum (ArgMax, All, TopK, TopP, TopKThenTopP)
+
+Important public types:
+
+- `LoadOptions`
+- `GenerateOptions`
+- `GenerationStats`
+- `ChatMessage`
+- `MessageRole`
+- `TemplateErrorMode`
+- `BonsaiModel`
+
+Current default generation behavior:
+
+- `temperature = 0.5`
+- `top_p = 0.85`
+- `top_k = 20`
+- `repeat_penalty = 1.1`
+- `repeat_last_n = 256`
+- `no_repeat_ngram_size = 6`
+- `seed = rand::random()` (new random seed each run)
+
+### `bonsai-cli`
+
+Main responsibilities:
+
+- parse CLI args
+- build `GenerateOptions`
+- choose `CPU` or `Metal`
+- run prompt-based or message-based generation
+- print final stats
+
+Useful flags:
+
+- `--model <path>` — either `.gguf` file or directory containing MLX/HF
+  weights (`config.json`, `model.safetensors`, `tokenizer.json`,
+  `chat_template.jinja`); autodetected
+- `--device auto|cpu|metal`
+- `--prompt "..."` or `--messages-file messages.json`
+- `--raw-prompt`
+- `--template-mode strict|warn-fallback`
+- `--seed <u64>` (optional; random if omitted)
+- `--repeat-penalty`
+- `--repeat-last-n`
+- `--no-repeat-ngram-size`
+
+## Vendored Candle Patches
+
+Only `candle-core` and `candle-metal-kernels` are vendored. `candle-nn` and `candle-transformers` come from crates.io. The `[patch.crates-io]` section in the root `Cargo.toml` ensures all crates (including upstream candle-nn/candle-transformers) resolve to the patched candle-core.
+
+### Quantized GGUF support
+
+Patched files:
+
+- `vendor/candle/candle-core/src/quantized/mod.rs`
+- `vendor/candle/candle-core/src/quantized/ggml_file.rs`
+- `vendor/candle/candle-core/src/quantized/k_quants.rs`
+- `vendor/candle/candle-core/src/quantized/metal.rs`
+- `vendor/candle/candle-metal-kernels/src/metal_src/quantized.metal`
+- `vendor/candle/candle-metal-kernels/src/kernels/quantized.rs`
+
+What these patches do:
+
+- add GGUF dtype `Q1_0_g128`
+- map GGUF dtype id `41`
+- load and store `BlockQ1_0_g128`
+- support CPU quantized matmul for this format
+- support Metal quantized kernels for this format
+- add runtime-only dtype `Q2MLX` with `BlockQ2MLX { scale: f16, bias: f16,
+  qs: [u8; 32] }` (36 bytes / 128 weights = 2.25 bpw). CPU: `to_float`,
+  `vec_dot` via Q8_0 activations, `matmul_q2_mlx` helper. Metal:
+  `dequantize_q2_mlx` + `kernel_mul_mv_q2_mlx_f32` + template instantiation
+  `kernel_mul_mm_q2_mlx_f32`. Constructed from MLX safetensors via
+  `QStorage::from_data(..., GgmlDType::Q2MLX)`; has no GGUF id.
+
+Important rule:
+
+- do not replace these with upstream Candle without verifying that upstream fully supports `Q1_0_g128`
+- `candle-nn` and `candle-transformers` can be upgraded on crates.io independently as long as their API is compatible with the types used in `bonsai-candle/src/qwen3.rs`
+
+### Qwen3 / Bonsai model
+
+The quantized Qwen3 model lives in `crates/bonsai-candle/src/qwen3.rs`. It is not taken from candle-transformers at runtime — it is a local copy extended with YaRN rope scaling.
+
+What to preserve:
+
+- Bonsai GGUF loads through the quantized Qwen3 path in `crates/bonsai-candle/src/qwen3.rs`
+- YaRN rope scaling reads `qwen3.rope.scaling.type`, `.factor`, `.original_context_length`, `.yarn_beta_fast`, `.yarn_beta_slow`, `.yarn_log_multiplier` from GGUF metadata
+- `ConcatKvCache` in `src/kv_cache.rs` uses concatenation (not slice_set) — keep this for Metal performance
+
+### Chat template compatibility
+
+Library file:
+
+- `crates/bonsai-candle/src/lib.rs`
+
+What to preserve:
+
+- prompt rendering uses `minijinja`
+- Python-like string methods are provided through `minijinja-contrib` with `pycompat`
+- `TemplateErrorMode::Strict` must fail loudly
+- `TemplateErrorMode::WarnFallback` may fall back to the Bonsai/Qwen prompt format and surface the warning in stats
+
+## Invariants To Keep
+
+- Rust inference must continue to work without external llama.cpp or MLX calls
+- `vendor/candle` contains only `candle-core` and `candle-metal-kernels`; `candle-nn` and `candle-transformers` come from crates.io
+- `[patch.crates-io]` must always redirect `candle-core` and `candle-metal-kernels` to vendor
+- model logic (qwen3, kv_cache, generation) lives in `bonsai-candle`, not in candle-transformers
+- `bonsai-candle` remains the only place that owns generation logic
+- CLI should stay a thin wrapper around the library
+- streaming output must flush during generation, not only at the end
+- anti-repeat logic must include both rolling repeat penalty and no-repeat n-gram blocking
+- message-based generation must support `system`, `user`, and `assistant`
+- raw prompt mode only supports a single user message
+
+## Common Commands
+
+### Build
+
+```bash
+cargo check -p bonsai-cli
+```
+
+### Tests
+
+```bash
+cargo test -p bonsai-candle -p bonsai-cli
+```
+
+### Run on CPU
+
+```bash
+cargo run --release -p bonsai-cli -- \
+  --device cpu \
+  --model /path/to/Bonsai-1.7B.gguf \
+  --prompt "What is the capital of France?"
+```
+
+### Run on Metal
+
+```bash
+cargo run --release -p bonsai-cli -- \
+  --device metal \
+  --model /path/to/Bonsai-1.7B.gguf \
+  --prompt "What is the capital of France?"
+```
+
+### Run with an MLX/HF directory (CPU or Metal)
+
+```bash
+huggingface-cli download prism-ml/Ternary-Bonsai-8B-mlx-2bit \
+  --local-dir /tmp/ternary-bonsai-8b
+cargo run --release -p bonsai-cli -- \
+  --device metal \
+  --model /tmp/ternary-bonsai-8b \
+  --prompt "What is the capital of France?"
+```
+
+### Run with chat history
+
+```bash
+cargo run --release -p bonsai-cli -- \
+  --device cpu \
+  --model /path/to/Bonsai-1.7B.gguf \
+  --messages-file messages.json
+```
+
+Minimal `messages.json` shape:
+
+```json
+[
+  { "role": "system", "content": "You are concise." },
+  { "role": "user", "content": "Say hello." }
+]
+```
+
+## When Editing This Project
+
+- prefer changing `crates/bonsai-candle` first and only then updating the CLI
+- if behavior changes, add or update tests in the touched crate
+- if you touch quantized loading or matmul, verify both CPU and Metal code paths
+- if you touch `src/qwen3.rs`, remember it is not the candle-transformers version — it is a local copy with YaRN
+- if you touch prompt rendering, verify both:
+  - `--template-mode strict`
+  - `--template-mode warn-fallback`
+- if you touch streaming, verify that text appears before process exit
+- if you touch repeat control, verify long generations do not collapse into repeated paragraphs
+
+## Things That Are Easy To Break
+
+- GGUF dtype parsing for `Q1_0_g128`
+- tensor/block layout assumptions in quantized matmul
+- Metal kernel name mapping between Rust and `.metal` code
+- YaRN rope scaling metadata parsing in `src/qwen3.rs`
+- prompt rendering when the GGUF chat template uses Python-like string methods
+- token streaming if buffering changes suppress intermediate flushes
+- stats if timing starts after the first generated token
+- `[patch.crates-io]` removal — would silently switch to upstream candle-core without Q1_0_g128
+
+## Recommended Review Checklist
+
+Before closing a Rust change, check:
+
+- `cargo fmt`
+- `cargo test -p bonsai-candle -p bonsai-cli`
+- `cargo run --release -p bonsai-cli -- --device cpu --model ... --prompt "..."`
+- if on macOS, also run the same command with `--device metal`
+
+If the change touches `vendor/candle`, verify that the local workspace still builds and that no dependency silently switched back to upstream Candle (check `[patch.crates-io]` is intact).
+
+If the change touches `candle-nn` or `candle-transformers` versions, verify that the types used in `src/qwen3.rs` (`QMatMul`, `RmsNorm`, `repeat_kv`) are still available and compatible.
