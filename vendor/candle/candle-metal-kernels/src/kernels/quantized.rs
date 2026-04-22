@@ -6,6 +6,7 @@ use objc2_metal::{MTLResourceUsage, MTLSize};
 #[derive(Debug, Clone, Copy)]
 pub enum GgmlDType {
     Q1_0_g128,
+    Q2_0,
     Q2MLX,
     Q4_0,
     Q4_1,
@@ -63,6 +64,7 @@ pub fn call_quantized_matmul_mv_t(
 
     let (nth0, nth1, align) = match dtype {
         GgmlDType::Q1_0_g128
+        | GgmlDType::Q2_0
         | GgmlDType::Q2MLX
         | GgmlDType::Q4_0
         | GgmlDType::Q4_1
@@ -127,6 +129,7 @@ pub fn call_quantized_matmul_mv_t(
     };
     let name = match dtype {
         GgmlDType::Q1_0_g128 => "kernel_mul_mv_q1_0_g128_f32",
+        GgmlDType::Q2_0 => "kernel_mul_mv_q2_0_f32",
         GgmlDType::Q2MLX => "kernel_mul_mv_q2_mlx_f32",
         GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f32",
         GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f32",
@@ -237,6 +240,7 @@ pub fn call_quantized_matmul_mm_t(
     };
     let name = match dtype {
         GgmlDType::Q1_0_g128 => "kernel_mul_mm_q1_0_g128_f32",
+        GgmlDType::Q2_0 => "kernel_mul_mm_q2_0_f32",
         GgmlDType::Q2MLX => "kernel_mul_mm_q2_mlx_f32",
         GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
         GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",

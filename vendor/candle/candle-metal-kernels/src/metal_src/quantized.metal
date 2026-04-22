@@ -101,6 +101,16 @@ static_assert(sizeof(block_q2_mlx) == 2 * sizeof(half) + QK2_MLX / 4, "wrong q2_
 #define N_R0_Q2_MLX 4
 #define N_SG_Q2_MLX 2
 
+#define QK2_0 128
+typedef struct {
+    half d;
+    uint8_t qs[QK2_0 / 4]; // 2 bits per weight, 4 weights per byte; 0→-d, 1→0, 2/3→+d
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+#define N_R0_Q2_0 4
+#define N_SG_Q2_0 2
+
 typedef struct {
     half d[4];        // deltas for 4 q4_0 blocks
     uint8_t qs[QK4_0 * 2]; // nibbles / quants for 4 q4_0 blocks
@@ -2278,6 +2288,25 @@ inline float block_q_n_dot_y(device const block_q2_mlx * qb_curr, float sumy, th
     return scale * sum_qy + bias * sumy;
 }
 
+// Partial dot product between a 16-weight slice of a Q2_0 block and 16 activations.
+// `il` is the slice offset within the block (0, 16, 32, ..., 112).
+// Per-block formula: w[j] = d * t[j], t ∈ {-1, 0, +1} derived from 2-bit code.
+// Encoding: 0b00→-1, 0b01→0, 0b10/0b11→+1.
+inline float block_q_n_dot_y(device const block_q2_0 * qb_curr, float sumy, thread float * yl, int il) {
+    const float d = qb_curr->d;
+    const int byte_offset = il / 4;
+    device const uint8_t * qs = qb_curr->qs + byte_offset;
+    float acc = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        const int byte_idx = i / 4;
+        const int shift = 2 * (i % 4);
+        const int q = (qs[byte_idx] >> shift) & 0x3;
+        const float t = (q == 0) ? -1.0f : (q == 1) ? 0.0f : 1.0f;
+        acc += yl[i] * t;
+    }
+    return d * acc;
+}
+
 // function for calculate inner product between half a q4_0 block and 16 floats (yl), sumy is SUM(yl[i])
 // il indicates where the q4 quants begin (0 or QK4_0/4)
 // we assume that the yl's have been multiplied with the appropriate scale factor
@@ -2562,6 +2591,72 @@ kernel void kernel_mul_mv_q2_mlx_f32(
     }
 
     for (int row = 0; row < N_R0_Q2_MLX; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[im * ne0 * ne1 + r1 * ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+kernel void kernel_mul_mv_q2_0_f32(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int nb = ne00 / QK2_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * N_SG_Q2_0 + sgitg) * N_R0_Q2_0;
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+    const uint offset0 = first_row * nb + (i12 / r2) * (nb * ne01) + (i13 / r3) * (nb * ne01 * ne02);
+
+    device const block_q2_0 * x = (device const block_q2_0 *) src0 + offset0;
+    device const float * y = (device const float *) src1 + r1 * ne10 + im * ne00 * ne1;
+
+    float yl[16];
+    float sumf[N_R0_Q2_0] = {0.f};
+
+    const int ix = tiisg / 8;
+    const int il = (tiisg % 8) * 16;
+    device const float * yb = y + ix * QK2_0 + il;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH / 8) {
+        float sumy = 0.f;
+        for (short i = 0; i < 16; i++) {
+            yl[i] = yb[i];
+            sumy += yb[i];
+        }
+
+        for (short row = 0; row < N_R0_Q2_0; row++) {
+            sumf[row] += block_q_n_dot_y(x + ib + row * nb, sumy, yl, il);
+        }
+
+        yb += QK2_0 * (N_SIMDWIDTH / 8);
+    }
+
+    for (int row = 0; row < N_R0_Q2_0; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne01) {
             dst[im * ne0 * ne1 + r1 * ne0 + first_row + row] = tot;
@@ -6717,6 +6812,24 @@ void dequantize_q2_mlx(device const block_q2_mlx * xb, short il, thread type4x4 
     reg = (type4x4)reg_f;
 }
 
+// Dequantize a 16-weight slice of a Q2_0 block into a 4x4 tile. `il` ∈ 0..7
+// selects which slice (4 bytes of qs, 16 packed weights).
+// Encoding: 0b00→-d, 0b01→0, 0b10/0b11→+d.
+template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    const int byte_offset = il * 4;
+    device const uint8_t * qs = xb->qs + byte_offset;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        const int byte_idx = i / 4;
+        const int shift = 2 * (i % 4);
+        const int q = (qs[byte_idx] >> shift) & 0x3;
+        reg_f[i / 4][i % 4] = (q == 0) ? -d : (q == 1) ? 0.0f : d;
+    }
+    reg = (type4x4)reg_f;
+}
+
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 *xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
@@ -7624,6 +7737,7 @@ template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mat_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mat_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16>;
 #endif
 template [[host_name("kernel_mul_mm_q1_0_g128_f32")]] kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q1_0_g128, 8,     dequantize_q1_0_g128>;
+template [[host_name("kernel_mul_mm_q2_0_f32")]]      kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q2_0,      8,     dequantize_q2_0>;
 template [[host_name("kernel_mul_mm_q2_mlx_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q2_mlx,    8,     dequantize_q2_mlx>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0>;
 template [[host_name("kernel_mul_mm_q4_1_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q4_1,    2,     dequantize_q4_1>;

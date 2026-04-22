@@ -21,6 +21,7 @@ pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
 pub const QK1_0_G128: usize = 128;
 pub const QK2_MLX: usize = 128;
+pub const QK2_0: usize = 128;
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -116,6 +117,16 @@ pub struct BlockQ1_0_g128 {
     pub(crate) qs: [u8; QK1_0_G128 / 8],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ1_0_g128>() == 18);
+
+/// GGUF 2-bit ternary quantization block (dtype 42). w = d * t, t ∈ {-1, 0, +1}.
+/// 2 bits per weight, 4 weights per byte. Encoding: 0b00→-d, 0b01→0, 0b10/0b11→+d.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockQ2_0 {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK2_0 / 4],
+}
+const _: () = assert!(std::mem::size_of::<BlockQ2_0>() == 34);
 
 /// MLX-style 2-bit affine quantization block (`w = scale * q + bias`, q ∈ {0,1,2,3}).
 /// Layout matches MLX's on-disk safetensors representation: 16 weights packed into
@@ -962,6 +973,107 @@ impl GgmlType for BlockQ2MLX {
                     sum_x += y;
                 }
                 sumf += d_y * (scale * sum_q_x as f32 + bias * sum_x as f32);
+            }
+        }
+        sumf
+    }
+}
+
+impl GgmlType for BlockQ2_0 {
+    const DTYPE: GgmlDType = GgmlDType::Q2_0;
+    const BLCK_SIZE: usize = QK2_0;
+    type VecDotType = BlockQ8_0;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK2_0),
+            "dequantize_row_q2_0: {k} is not divisible by {QK2_0}"
+        );
+        let nb = k / QK2_0;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK2_0 {
+                let byte_index = j / 4;
+                let shift = 2 * (j % 4);
+                let q = (xs[i].qs[byte_index] >> shift) & 0b11;
+                ys[i * QK2_0 + j] = match q {
+                    0 => -d,
+                    1 => 0.0,
+                    _ => d,
+                };
+            }
+        }
+    }
+
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        let k = xs.len();
+        debug_assert!(
+            k.is_multiple_of(Self::BLCK_SIZE),
+            "{k} is not divisible by {}",
+            Self::BLCK_SIZE
+        );
+        debug_assert_eq!(
+            ys.len(),
+            k / Self::BLCK_SIZE,
+            "size mismatch {} {} {}",
+            xs.len(),
+            ys.len(),
+            Self::BLCK_SIZE
+        );
+        for (i, ys) in ys.iter_mut().enumerate() {
+            let xs_block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
+            let max_abs = xs_block.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            ys.d = f16::from_f32(max_abs);
+            ys.qs.fill(0);
+            if max_abs == 0.0 {
+                continue;
+            }
+            for (j, &v) in xs_block.iter().enumerate() {
+                let byte_index = j / 4;
+                let shift = 2 * (j % 4);
+                let q: u8 = if v > max_abs * 0.5 {
+                    2 // +d
+                } else if v < -max_abs * 0.5 {
+                    0 // -d
+                } else {
+                    1 // 0
+                };
+                ys.qs[byte_index] |= q << shift;
+            }
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK2_0),
+            "vec_dot_q2_0_q8_0: {n} is not divisible by {QK2_0}"
+        );
+        let nb = n / QK2_0;
+        let mut sumf = 0f32;
+        for i in 0..nb {
+            let d0 = xs[i].d.to_f32();
+            // 4 Q8_0 activation sub-blocks cover one Q2_0 weight block (32*4=128).
+            for k in 0..4 {
+                let d1 = ys[i * 4 + k].d.to_f32();
+                let mut sumi_block = 0i32;
+                for j in 0..QK8_0 {
+                    let weight_j = k * QK8_0 + j;
+                    let byte_index = weight_j / 4;
+                    let shift = 2 * (weight_j % 4);
+                    let q = (xs[i].qs[byte_index] >> shift) & 0b11;
+                    let t: i32 = match q {
+                        0 => -1,
+                        1 => 0,
+                        _ => 1,
+                    };
+                    sumi_block += t * ys[i * 4 + k].qs[j] as i32;
+                }
+                sumf += d0 * d1 * sumi_block as f32;
             }
         }
         sumf
@@ -2700,6 +2812,70 @@ pub fn matmul_q2_mlx_f16(
     let lhs_f32 = lhs.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
     let mut dst_f32 = vec![0f32; dst.len()];
     matmul_q2_mlx(mkn, &lhs_f32, rhs_t, &mut dst_f32)?;
+    for (dst, value) in dst.iter_mut().zip(dst_f32.iter()) {
+        *dst = f16::from_f32(*value);
+    }
+    Ok(())
+}
+
+pub fn matmul_q2_0(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs_t: &[BlockQ2_0],
+    dst: &mut [f32],
+) -> Result<()> {
+    if m * k != lhs.len() {
+        crate::bail!("unexpected lhs length {} ({m},{k},{n})", lhs.len());
+    }
+    if !k.is_multiple_of(QK8_0) {
+        crate::bail!("lhs width {k} is not divisible by {QK8_0}");
+    }
+    if !k.is_multiple_of(QK2_0) {
+        crate::bail!("rhs width {k} is not divisible by {QK2_0}");
+    }
+    let lhs_blocks_per_row = k / QK8_0;
+    let rhs_blocks_per_col = k / QK2_0;
+    let expected_rhs_blocks = n * rhs_blocks_per_col;
+    if rhs_t.len() != expected_rhs_blocks {
+        crate::bail!(
+            "unexpected rhs length {} != {} (n={n}, rhs_blocks_per_col={rhs_blocks_per_col})",
+            rhs_t.len(),
+            expected_rhs_blocks
+        );
+    }
+    let mut lhs_b = vec![BlockQ8_0::zeros(); m * lhs_blocks_per_row];
+    for row_idx in 0..m {
+        let lhs_row = &lhs[row_idx * k..(row_idx + 1) * k];
+        let lhs_b_row =
+            &mut lhs_b[row_idx * lhs_blocks_per_row..(row_idx + 1) * lhs_blocks_per_row];
+        BlockQ8_0::from_float(lhs_row, lhs_b_row);
+    }
+    for row_idx in 0..m {
+        let lhs_row = &lhs_b[row_idx * lhs_blocks_per_row..(row_idx + 1) * lhs_blocks_per_row];
+        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
+        dst_row
+            .into_par_iter()
+            .enumerate()
+            .with_min_len(128)
+            .with_max_len(512)
+            .for_each(|(col_idx, dst)| {
+                let rhs_col =
+                    &rhs_t[col_idx * rhs_blocks_per_col..(col_idx + 1) * rhs_blocks_per_col];
+                *dst = BlockQ2_0::vec_dot(k, rhs_col, lhs_row);
+            });
+    }
+    Ok(())
+}
+
+pub fn matmul_q2_0_f16(
+    mkn: (usize, usize, usize),
+    lhs: &[f16],
+    rhs_t: &[BlockQ2_0],
+    dst: &mut [f16],
+) -> Result<()> {
+    let lhs_f32 = lhs.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+    let mut dst_f32 = vec![0f32; dst.len()];
+    matmul_q2_0(mkn, &lhs_f32, rhs_t, &mut dst_f32)?;
     for (dst, value) in dst.iter_mut().zip(dst_f32.iter()) {
         *dst = f16::from_f32(*value);
     }

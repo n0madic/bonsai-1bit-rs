@@ -61,6 +61,11 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ1_0_g128> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ1_0_g128::to_float(&vec, &mut out);
             }
+            GgmlDType::Q2_0 => {
+                let vec: Vec<crate::quantized::k_quants::BlockQ2_0> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::k_quants::BlockQ2_0::to_float(&vec, &mut out);
+            }
             GgmlDType::Q2MLX => {
                 let vec: Vec<crate::quantized::k_quants::BlockQ2MLX> =
                     read_to_vec(&buffer, block_len);
@@ -381,6 +386,7 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
     fn from(value: GgmlDType) -> Self {
         match value {
             GgmlDType::Q1_0_g128 => candle_metal_kernels::GgmlDType::Q1_0_g128,
+            GgmlDType::Q2_0 => candle_metal_kernels::GgmlDType::Q2_0,
             GgmlDType::Q2MLX => candle_metal_kernels::GgmlDType::Q2MLX,
             GgmlDType::Q4_0 => candle_metal_kernels::GgmlDType::Q4_0,
             GgmlDType::Q4_1 => candle_metal_kernels::GgmlDType::Q4_1,

@@ -92,6 +92,9 @@ impl QStorage {
                 GgmlDType::Q1_0_g128 => {
                     metal::load_quantized(d, as_t_slice::<BlockQ1_0_g128>(data))
                 }
+                GgmlDType::Q2_0 => {
+                    metal::load_quantized(d, as_t_slice::<BlockQ2_0>(data))
+                }
                 GgmlDType::Q2MLX => {
                     // Copy bytes into an owned Vec<BlockQ2MLX> to avoid reading
                     // from freed memory: `as_t_slice(Cow::Owned(..))` returns a
@@ -130,6 +133,7 @@ impl QStorage {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
                 GgmlDType::F16 => cuda::load_quantized(d, as_t_slice::<f16>(data)),
                 GgmlDType::Q1_0_g128 => crate::bail!("Q1_0_g128 is not supported on CUDA"),
+                GgmlDType::Q2_0 => crate::bail!("Q2_0 is not supported on CUDA"),
                 GgmlDType::Q2MLX => crate::bail!("Q2MLX is not supported on CUDA"),
                 GgmlDType::Q4_0 => cuda::load_quantized(d, as_t_slice::<BlockQ4_0>(data)),
                 GgmlDType::Q4_1 => cuda::load_quantized(d, as_t_slice::<BlockQ4_1>(data)),
@@ -284,6 +288,7 @@ pub enum GgmlDType {
     F16,
     BF16,
     Q1_0_g128,
+    Q2_0,
     Q2MLX,
     Q4_0,
     Q4_1,
@@ -319,6 +324,7 @@ impl GgmlDType {
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
             41 => Self::Q1_0_g128,
+            42 => Self::Q2_0,
             // Q2MLX is a runtime-only dtype loaded from MLX safetensors;
             // it is never read from GGUF files, so we don't claim a GGUF id.
             _ => crate::bail!("unknown dtype for tensor {u}"),
@@ -331,6 +337,7 @@ impl GgmlDType {
             Self::F32 => 0,
             Self::F16 => 1,
             Self::Q1_0_g128 => 41,
+            Self::Q2_0 => 42,
             Self::Q2MLX => {
                 panic!("Q2MLX dtype has no GGUF id; it is loaded from MLX safetensors only")
             }
@@ -357,6 +364,7 @@ impl GgmlDType {
             Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
             Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
             Self::Q1_0_g128 => Box::new(Q1_0G128Storage::zeros(elem_count)),
+            Self::Q2_0 => Box::new(Q2_0Storage::zeros(elem_count)),
             Self::Q2MLX => Box::new(Q2MLXStorage::zeros(elem_count)),
             Self::Q4_0 => Box::new(vec![BlockQ4_0::zeros(); elem_count / BlockQ4_0::BLCK_SIZE]),
             Self::Q4_1 => Box::new(vec![BlockQ4_1::zeros(); elem_count / BlockQ4_1::BLCK_SIZE]),
@@ -380,6 +388,9 @@ impl GgmlDType {
             Self::F16 => Box::new(as_t_slice::<f16>(data).to_vec()),
             Self::Q1_0_g128 => {
                 Box::new(Q1_0G128Storage(as_t_slice::<BlockQ1_0_g128>(data).to_vec()))
+            }
+            Self::Q2_0 => {
+                Box::new(Q2_0Storage(as_t_slice::<BlockQ2_0>(data).to_vec()))
             }
             Self::Q2MLX => {
                 // Copy data into BlockQ2MLX blocks. We avoid `as_t_slice(..).to_vec()`
@@ -422,6 +433,7 @@ impl GgmlDType {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::Q1_0_g128 => std::mem::size_of::<BlockQ1_0_g128>(),
+            Self::Q2_0 => std::mem::size_of::<BlockQ2_0>(),
             Self::Q2MLX => std::mem::size_of::<BlockQ2MLX>(),
             Self::Q4_0 => std::mem::size_of::<BlockQ4_0>(),
             Self::Q4_1 => std::mem::size_of::<BlockQ4_1>(),
@@ -445,6 +457,7 @@ impl GgmlDType {
             Self::F32 => 1,
             Self::F16 | Self::BF16 => 1,
             Self::Q1_0_g128 => k_quants::QK1_0_G128,
+            Self::Q2_0 => k_quants::QK2_0,
             Self::Q2MLX => k_quants::QK2_MLX,
             Self::Q4_0 => k_quants::QK4_0,
             Self::Q4_1 => k_quants::QK4_1,
@@ -623,6 +636,61 @@ impl QuantizedType for Q2MLXStorage {
 
     fn size(&self) -> usize {
         self.0.len() * std::mem::size_of::<BlockQ2MLX>()
+    }
+}
+
+struct Q2_0Storage(Vec<BlockQ2_0>);
+
+impl Q2_0Storage {
+    fn zeros(elem_count: usize) -> Self {
+        Self(vec![
+            BlockQ2_0::zeros();
+            elem_count / BlockQ2_0::BLCK_SIZE
+        ])
+    }
+}
+
+impl QuantizedType for Q2_0Storage {
+    fn dtype(&self) -> GgmlDType {
+        GgmlDType::Q2_0
+    }
+
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        k_quants::matmul_q2_0(mkn, lhs, self.0.as_slice(), dst)
+    }
+
+    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
+        k_quants::matmul_q2_0_f16(mkn, lhs, self.0.as_slice(), dst)
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+        let mut ys = vec![0f32; elem_count];
+        BlockQ2_0::to_float(self.0.as_slice(), &mut ys);
+        Ok(CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        self.0.len() * std::mem::size_of::<BlockQ2_0>()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr() as *const u8
+    }
+
+    fn block_size(&self) -> usize {
+        BlockQ2_0::BLCK_SIZE
+    }
+
+    fn from_float(&mut self, xs: &[f32]) {
+        BlockQ2_0::from_float(xs, &mut self.0)
+    }
+
+    fn from_float_imatrix(&mut self, xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        self.from_float(xs)
+    }
+
+    fn size(&self) -> usize {
+        self.0.len() * std::mem::size_of::<BlockQ2_0>()
     }
 }
 

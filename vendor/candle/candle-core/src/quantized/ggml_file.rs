@@ -163,6 +163,14 @@ pub fn qtensor_from_ggml(
             )?;
             super::QTensor::new(storage, dims)
         }
+        GgmlDType::Q2_0 => {
+            let storage = QStorage::from_data(
+                Cow::Borrowed(&raw_data[..size_in_bytes]),
+                device,
+                ggml_dtype,
+            )?;
+            super::QTensor::new(storage, dims)
+        }
         GgmlDType::Q4_0 => {
             from_raw_data::<k_quants::BlockQ4_0>(raw_data, size_in_bytes, dims, device)
         }

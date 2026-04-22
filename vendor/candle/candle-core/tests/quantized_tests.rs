@@ -1253,6 +1253,7 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
         GgmlDType::Q1_0_g128 => 0.5,
+        GgmlDType::Q2_0 => 0.5,
         GgmlDType::Q2MLX => 0.5,
     };
     Ok(err)
