@@ -1,9 +1,11 @@
 mod generation;
 mod kv_cache;
 mod qwen3;
+mod qwen3_5;
 
 use crate::generation::{LogitsProcessor, Sampling};
 use crate::qwen3::{ModelWeights, Qwen3Config, SafeTensorsSource};
+use crate::qwen3_5::{Qwen35Config, Qwen35Weights};
 use anyhow::{anyhow, bail, Context, Result};
 use candle::quantized::gguf_file;
 use candle::quantized::tokenizer::TokenizerFromGguf;
@@ -18,6 +20,14 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
+
+/// Minimal probe to read `model_type` from a HuggingFace `config.json` before
+/// committing to a full architecture-specific config parse.
+#[derive(Debug, Deserialize)]
+struct ModelTypeProbe {
+    #[serde(default)]
+    model_type: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevicePreference {
@@ -133,8 +143,30 @@ impl ChatMessage {
     }
 }
 
+/// Loaded model weights for one of the supported architectures.
+enum Model {
+    Qwen3(ModelWeights),
+    Qwen35(Qwen35Weights),
+}
+
+impl Model {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> candle::Result<Tensor> {
+        match self {
+            Model::Qwen3(m) => m.forward(input, offset),
+            Model::Qwen35(m) => m.forward(input, offset),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            Model::Qwen3(m) => m.clear_kv_cache(),
+            Model::Qwen35(m) => m.clear_state(),
+        }
+    }
+}
+
 pub struct BonsaiModel {
-    model: ModelWeights,
+    model: Model,
     tokenizer: Tokenizer,
     prompt_formatter: PromptFormatter,
     device: candle::Device,
@@ -158,25 +190,14 @@ impl BonsaiModel {
     pub fn load_from_hf_dir(dir: &Path, opts: LoadOptions) -> Result<Self> {
         let device = resolve_device(opts.device)?;
         let cfg_path = dir.join("config.json");
-        let cfg_file = std::fs::File::open(&cfg_path)
-            .with_context(|| format!("failed to open {}", cfg_path.display()))?;
-        let cfg: Qwen3Config = serde_json::from_reader(cfg_file)
+        let cfg_str = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("failed to read {}", cfg_path.display()))?;
+        let probe: ModelTypeProbe = serde_json::from_str(&cfg_str)
             .with_context(|| format!("failed to parse {}", cfg_path.display()))?;
 
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow!("failed to load {}: {e}", tokenizer_path.display()))?;
-        let eos_token_id = cfg
-            .eos_token_id
-            .or_else(|| tokenizer.get_vocab(true).get("<|im_end|>").copied());
-        let eos_token_str = eos_token_id
-            .and_then(|id| tokenizer.id_to_token(id))
-            .unwrap_or_default();
-
-        let template_path = dir.join("chat_template.jinja");
-        let template_str = std::fs::read_to_string(&template_path).ok();
-        let prompt_formatter =
-            PromptFormatter::from_template(template_str, String::new(), eos_token_str);
 
         let weights_path = dir.join("model.safetensors");
         let weights_file = std::fs::File::open(&weights_path)
@@ -188,10 +209,36 @@ impl BonsaiModel {
         let st = SafeTensors::deserialize(&mmap)
             .map_err(|e| anyhow!("failed to parse safetensors: {e}"))?;
         let mut src = SafeTensorsSource::new(st, device.clone());
-        let model = ModelWeights::from_safetensors(&mut src, &cfg, &device)
-            .context("failed to load Bonsai weights from MLX safetensors")?;
 
-        let max_seq_len = cfg.max_position_embeddings;
+        let (model, config_eos, max_seq_len) = if probe.model_type.as_deref() == Some("qwen3_5") {
+            let cfg: Qwen35Config = serde_json::from_str(&cfg_str)
+                .with_context(|| format!("failed to parse {}", cfg_path.display()))?;
+            let model = Qwen35Weights::from_safetensors(&mut src, &cfg, &device)
+                .context("failed to load Bonsai qwen3_5 weights from MLX safetensors")?;
+            let max_seq_len = cfg.max_position_embeddings();
+            (Model::Qwen35(model), cfg.eos_token_id(), max_seq_len)
+        } else {
+            let cfg: Qwen3Config = serde_json::from_str(&cfg_str)
+                .with_context(|| format!("failed to parse {}", cfg_path.display()))?;
+            let model = ModelWeights::from_safetensors(&mut src, &cfg, &device)
+                .context("failed to load Bonsai weights from MLX safetensors")?;
+            (
+                Model::Qwen3(model),
+                cfg.eos_token_id,
+                cfg.max_position_embeddings,
+            )
+        };
+
+        let eos_token_id =
+            config_eos.or_else(|| tokenizer.get_vocab(true).get("<|im_end|>").copied());
+        let eos_token_str = eos_token_id
+            .and_then(|id| tokenizer.id_to_token(id))
+            .unwrap_or_default();
+
+        let template_path = dir.join("chat_template.jinja");
+        let template_str = std::fs::read_to_string(&template_path).ok();
+        let prompt_formatter =
+            PromptFormatter::from_template(template_str, String::new(), eos_token_str);
 
         Ok(Self {
             model,
@@ -221,7 +268,7 @@ impl BonsaiModel {
         let model = ModelWeights::from_gguf(content, &mut file, &device)
             .context("failed to load Bonsai weights")?;
         Ok(Self {
-            model,
+            model: Model::Qwen3(model),
             tokenizer,
             prompt_formatter,
             device,

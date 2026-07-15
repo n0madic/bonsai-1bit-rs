@@ -7,8 +7,9 @@ This workspace is a native Rust inference port for Bonsai models built on top of
 Current intended path:
 
 - load either a Bonsai GGUF file (`Bonsai-1.7B.gguf`, `Bonsai-8B.gguf`) or a
-  HuggingFace/MLX directory (e.g. `prism-ml/Ternary-Bonsai-8B-mlx-2bit`)
-- run inference on `CPU` for both, or `Metal` for GGUF
+  HuggingFace/MLX directory (e.g. `prism-ml/Ternary-Bonsai-8B-mlx-2bit`,
+  `prism-ml/Ternary-Bonsai-27B-mlx-2bit`)
+- run inference on `CPU` or `Metal` for both formats
 - use Candle-native GGUF loading / safetensors loading, tokenizer loading,
   sampling, and streaming output
 
@@ -19,7 +20,9 @@ Important constraints:
   - GGUF dtype `Q1_0_g128` — binary {−d, +d}, 1 bit/weight, block 128 (CPU + Metal)
   - runtime-only dtype `Q2MLX` — MLX 2-bit affine `w = scale·q + bias`
     (q ∈ {0,1,2,3}), group 128, loaded from MLX safetensors (CPU + Metal)
-- architecture for both is Qwen3 with YaRN rope scaling
+- architectures: Qwen3 with YaRN rope scaling (GGUF + `Ternary-Bonsai-8B`), and
+  the Qwen3.5 hybrid (`qwen3_5`, `Ternary-Bonsai-27B`) — text-only, dispatched by
+  `config.json` `model_type`
 
 ## Workspace Layout
 
@@ -33,6 +36,7 @@ Important constraints:
   - library crate
   - owns model loading, prompt rendering, token streaming, sampling, repeat control, and generation stats
   - contains the Qwen3/Bonsai model implementation with YaRN rope scaling (`src/qwen3.rs`)
+  - contains the Qwen3.5 hybrid implementation (`src/qwen3_5.rs`)
   - contains `ConcatKvCache` (`src/kv_cache.rs`) and `LogitsProcessor`/`Sampling` (`src/generation.rs`)
 - `crates/bonsai-cli`
   - CLI wrapper over `bonsai-candle`
@@ -62,6 +66,7 @@ Main responsibilities:
 Local modules (not from candle-transformers):
 
 - `src/qwen3.rs` — quantized Qwen3 model with YaRN rope scaling; adapted from candle-transformers with extended context support
+- `src/qwen3_5.rs` — Qwen3.5 hybrid (`qwen3_5`) text stack: Gated DeltaNet linear-attention + gated full-attention, loaded from MLX `Q2MLX` safetensors
 - `src/kv_cache.rs` — `ConcatKvCache` using `Tensor::cat` for Metal/CUDA-optimized KV cache
 - `src/generation.rs` — `LogitsProcessor` and `Sampling` enum (ArgMax, All, TopK, TopP, TopKThenTopP)
 
@@ -152,6 +157,43 @@ What to preserve:
 - Bonsai GGUF loads through the quantized Qwen3 path in `crates/bonsai-candle/src/qwen3.rs`
 - YaRN rope scaling reads `qwen3.rope.scaling.type`, `.factor`, `.original_context_length`, `.yarn_beta_fast`, `.yarn_beta_slow`, `.yarn_log_multiplier` from GGUF metadata
 - `ConcatKvCache` in `src/kv_cache.rs` uses concatenation (not slice_set) — keep this for Metal performance
+
+### Qwen3.5 hybrid model (`qwen3_5`)
+
+`crates/bonsai-candle/src/qwen3_5.rs` implements text-only inference for the
+`qwen3_5` architecture (`Ternary-Bonsai-27B`). `lib.rs` peeks `config.json`
+`model_type` and dispatches to `Qwen35Weights` vs the existing `ModelWeights`
+through the internal `Model` enum. Tensor names are `language_model.model.*` /
+`language_model.lm_head` (the vision tower and `mtp.*` are skipped).
+
+Structure (64 layers, one full-attention layer every `full_attention_interval = 4`):
+
+- **Gated DeltaNet** (linear layers): `in_proj_qkv/z/a/b` (Q2MLX) + a plain-F16
+  depthwise causal `conv1d` (kernel 4, applied as an explicit 4-tap MAC), silu,
+  L2-normed q/k with `repeat_interleave` k-heads to the v-head count, `beta =
+  sigmoid`, `g = -exp(A_log)·softplus(a + dt_bias)`, an explicit per-token
+  delta-rule recurrence, then `RMSNormGated` and `out_proj`. Per-layer state
+  (`conv_state`, `recurrent_state`) is F32 and carried across prefill/decode.
+- **Gated full-attention** (full layers): `q_proj` packs `[query | gate]`
+  interleaved per head, partial RoPE (rotates the first `partial_rotary_factor ×
+  head_dim` dims), GQA, and a `sigmoid(gate)` output gate. Reuses `ConcatKvCache`.
+
+Non-obvious details verified against the `transformers` `models/qwen3_5` reference:
+
+- The MLX checkpoint **folds the `+1`** of `Qwen3_5RMSNorm`'s `(1 + weight)` into the
+  stored weights (they are centered at ~1), so `Qwen35RmsNorm` applies plain
+  `weight`. Do not add `1` again — that double-scales every norm and produces
+  garbage output.
+- The output gate is `sigmoid(gate)` even though `output_gate_type = "swish"`; the
+  reference model does not read that config field.
+- The DeltaNet query is scaled by `1/sqrt(key_head_dim)` after L2-norm; the key is not.
+- The whole activation path runs in F32 — the vendored Metal quantized-matmul kernels
+  require F32 input and always emit F32 (`quantized/metal.rs`), so there is no F16 path
+  for `Q2MLX` projections. The one dense tensor is the embedding table, which is kept in
+  F16 (`dequantize_f16`, ~2.5 GB instead of ~5 GB); its rows are cast to F32 at use.
+
+The per-token recurrence is sequential, so 27B throughput is well below the
+plain-attention models; chunked prefill is a future optimization.
 
 ### Chat template compatibility
 
@@ -246,6 +288,7 @@ Minimal `messages.json` shape:
 - if behavior changes, add or update tests in the touched crate
 - if you touch quantized loading or matmul, verify both CPU and Metal code paths
 - if you touch `src/qwen3.rs`, remember it is not the candle-transformers version — it is a local copy with YaRN
+- if you touch `src/qwen3_5.rs`, cross-check the recurrence/conv/gate math against the `transformers` `models/qwen3_5` reference, and remember the MLX RMSNorm weights already include the `+1` (do not re-add it)
 - if you touch prompt rendering, verify both:
   - `--template-mode strict`
   - `--template-mode warn-fallback`
@@ -258,6 +301,7 @@ Minimal `messages.json` shape:
 - tensor/block layout assumptions in quantized matmul
 - Metal kernel name mapping between Rust and `.metal` code
 - YaRN rope scaling metadata parsing in `src/qwen3.rs`
+- `qwen3_5` RMSNorm weight handling (the MLX `+1` fold), the `sigmoid` output gate, the DeltaNet query `1/sqrt(head_dim)` scale, and the conv1d tap order
 - prompt rendering when the GGUF chat template uses Python-like string methods
 - token streaming if buffering changes suppress intermediate flushes
 - stats if timing starts after the first generated token

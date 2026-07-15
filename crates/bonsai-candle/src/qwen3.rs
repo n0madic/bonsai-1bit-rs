@@ -91,9 +91,21 @@ impl<'a> SafeTensorsSource<'a> {
         Ok(view.shape().to_vec())
     }
 
+    /// Load a plain (non-quantized) F16 tensor by its exact safetensors name,
+    /// bypassing the GGUF-name `translate` map. Used by the qwen3_5 loader for
+    /// tensors that have no GGUF-name equivalent (conv1d weight, A_log, dt_bias,
+    /// gated-norm weight, and the RMSNorm weights). Note the MLX conversion folds
+    /// the `+1` of the reference `(1 + weight)` RMSNorm into the stored weights,
+    /// so callers apply these weights as-is (do not add `1` again).
+    pub(crate) fn plain_f16(&self, name: &str) -> Result<Tensor> {
+        let bytes = self.tensor_bytes(name)?;
+        let shape = self.tensor_shape(name)?;
+        Tensor::from_raw_buffer(bytes, DType::F16, &shape, &self.device)
+    }
+
     /// Load a quantized projection encoded as `<base>.{weight,scales,biases}`
     /// into a Q2MLX-backed QTensor.
-    fn load_q2mlx(&self, base: &str) -> Result<QTensor> {
+    pub(crate) fn load_q2mlx(&self, base: &str) -> Result<QTensor> {
         let weight_bytes = self.tensor_bytes(&format!("{base}.weight"))?;
         let weight_shape = self.tensor_shape(&format!("{base}.weight"))?;
         let scales_bytes = self.tensor_bytes(&format!("{base}.scales"))?;
@@ -262,7 +274,7 @@ impl WeightSource for SafeTensorsSource<'_> {
 }
 
 #[derive(Debug, Clone)]
-struct MlpWeights {
+pub(crate) struct MlpWeights {
     gate_proj: QMatMul,
     up_proj: QMatMul,
     down_proj: QMatMul,
@@ -271,6 +283,20 @@ struct MlpWeights {
 }
 
 impl MlpWeights {
+    /// Build a SwiGLU MLP from three already-loaded quantized projections.
+    /// Shared with the qwen3_5 loader, which reads HuggingFace tensor names
+    /// directly instead of going through the GGUF-name `WeightSource` map.
+    pub(crate) fn from_qmatmuls(gate_proj: QMatMul, up_proj: QMatMul, down_proj: QMatMul) -> Self {
+        let span = tracing::span!(tracing::Level::TRACE, "mlp");
+        Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            act_fn: Activation::Silu,
+            span,
+        }
+    }
+
     fn new(src: &mut dyn WeightSource, prefix: &str) -> Result<Self> {
         let gate_proj = src.qmatmul(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = src.qmatmul(&format!("{prefix}.ffn_up.weight"))?;
@@ -316,7 +342,7 @@ enum RopeScaling {
 }
 
 impl RotaryEmbedding {
-    fn new_unscaled(
+    pub(crate) fn new_unscaled(
         dtype: DType,
         head_dim: usize,
         max_position_embeddings: usize,
