@@ -19,6 +19,7 @@
 //!   * The full-attention output gate is `sigmoid(gate)` (the `output_gate_type`
 //!     config field is not read by the reference model).
 //!   * The DeltaNet query is scaled by `1/sqrt(key_head_dim)` after L2-norm.
+use crate::hadamard::{self, HadamardLoader, HadamardManifest, HadamardTransform};
 use crate::kv_cache::ConcatKvCache;
 use crate::qwen3::{MlpWeights, RotaryEmbedding, SafeTensorsSource};
 use candle::{DType, Device, Result, Tensor, D};
@@ -43,6 +44,10 @@ pub struct Qwen35Config {
     pub text_config: Qwen35TextConfig,
     #[serde(default)]
     pub eos_token_id: Option<u32>,
+    /// Set for `prism_hadamard_qwen35` checkpoints: relative path (from the
+    /// model directory) to the `hadamard.json` manifest, e.g. `"hadamard.json"`.
+    #[serde(default)]
+    pub hadamard_config: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -153,7 +158,7 @@ struct Qwen35RmsNorm {
 
 impl Qwen35RmsNorm {
     fn load(src: &SafeTensorsSource<'_>, name: &str, eps: f64) -> Result<Self> {
-        let weight = src.plain_f16(name)?.to_dtype(DType::F32)?;
+        let weight = src.plain_tensor(name)?.to_dtype(DType::F32)?;
         Ok(Self { weight, eps })
     }
 
@@ -176,7 +181,7 @@ struct Qwen35RmsNormGated {
 
 impl Qwen35RmsNormGated {
     fn load(src: &SafeTensorsSource<'_>, name: &str, eps: f64) -> Result<Self> {
-        let weight = src.plain_f16(name)?.to_dtype(DType::F32)?;
+        let weight = src.plain_tensor(name)?.to_dtype(DType::F32)?;
         Ok(Self { weight, eps })
     }
 
@@ -189,6 +194,46 @@ impl Qwen35RmsNormGated {
         let gate = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
         (x_normed * gate)?.to_dtype(in_dtype)
     }
+}
+
+/// Registers a group of manifest weight names that all consume the same
+/// (Hadamard-rotated) input — e.g. q/k/v sharing `ln1(x)`, or `in_proj_qkv`/
+/// `in_proj_z` sharing the same DeltaNet input — and returns the one shared
+/// transform. `None` when there is no active manifest (plain `qwen3_5`).
+/// Each name is still registered individually with `HadamardLoader`, so its
+/// `.signs` tensor is verified and it counts as claimed for `finish()`.
+fn shared_in_transform(
+    hadamard: &mut Option<HadamardLoader>,
+    src: &SafeTensorsSource<'_>,
+    bases: &[String],
+    width: usize,
+) -> Result<Option<Arc<HadamardTransform>>> {
+    let Some(loader) = hadamard.as_mut() else {
+        return Ok(None);
+    };
+    let mut results = Vec::with_capacity(bases.len());
+    for base in bases {
+        results.push((base.as_str(), loader.transform_for(base, width, src)?));
+    }
+    let rotated_count = results.iter().filter(|(_, t)| t.is_some()).count();
+    if rotated_count != 0 && rotated_count != results.len() {
+        let rotated: Vec<&str> = results
+            .iter()
+            .filter(|(_, t)| t.is_some())
+            .map(|(b, _)| *b)
+            .collect();
+        let not_rotated: Vec<&str> = results
+            .iter()
+            .filter(|(_, t)| t.is_none())
+            .map(|(b, _)| *b)
+            .collect();
+        candle::bail!(
+            "hadamard manifest partially rotates a shared-input group: {rotated:?} are \
+             rotated but {not_rotated:?} are not — a group that shares one input must be \
+             all-or-nothing"
+        );
+    }
+    Ok(results.into_iter().find_map(|(_, t)| t))
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +255,12 @@ struct GatedAttention {
     rotary_dim: usize,
     rotary: Arc<RotaryEmbedding>,
     kv_cache: ConcatKvCache,
+    /// `prism_hadamard_qwen35` only: rotates the hidden-state input shared by
+    /// q/k/v; `None` for plain `qwen3_5`.
+    in_tf: Option<Arc<HadamardTransform>>,
+    /// `prism_hadamard_qwen35` only: rotates the attention context before
+    /// `o_proj`; `None` for plain `qwen3_5`.
+    out_tf: Option<Arc<HadamardTransform>>,
 }
 
 impl GatedAttention {
@@ -218,6 +269,7 @@ impl GatedAttention {
         cfg: &Qwen35TextConfig,
         rotary: Arc<RotaryEmbedding>,
         prefix: &str,
+        hadamard: &mut Option<HadamardLoader>,
     ) -> Result<Self> {
         if !cfg
             .num_attention_heads
@@ -233,6 +285,14 @@ impl GatedAttention {
         let load = |src: &mut SafeTensorsSource<'_>, n: &str| -> Result<QMatMul> {
             QMatMul::from_weights(Arc::new(src.load_q2mlx(&q(n))?))
         };
+        let mixer_out_dim = cfg.num_attention_heads * cfg.head_dim;
+        let in_tf = shared_in_transform(
+            hadamard,
+            src,
+            &[q("q_proj"), q("k_proj"), q("v_proj")],
+            cfg.hidden_size,
+        )?;
+        let out_tf = shared_in_transform(hadamard, src, &[q("o_proj")], mixer_out_dim)?;
         let q_proj = load(src, "q_proj")?;
         let k_proj = load(src, "k_proj")?;
         let v_proj = load(src, "v_proj")?;
@@ -253,6 +313,8 @@ impl GatedAttention {
             rotary_dim: cfg.rotary_dim(),
             rotary,
             kv_cache: ConcatKvCache::new(2),
+            in_tf,
+            out_tf,
         })
     }
 
@@ -288,10 +350,11 @@ impl GatedAttention {
         let (b, l, _) = x.dims3()?;
         let hd = self.head_dim;
         let nh = self.num_heads;
+        let xh = hadamard::apply(&self.in_tf, x)?;
 
         // q_proj packs [query | gate] interleaved per head: view as
         // (b, l, nh, 2*hd) and split the last axis in half.
-        let qg = self.q_proj.forward(x)?.reshape((b, l, nh, 2 * hd))?;
+        let qg = self.q_proj.forward(&xh)?.reshape((b, l, nh, 2 * hd))?;
         let query = qg.narrow(3, 0, hd)?.contiguous()?;
         let gate = qg
             .narrow(3, hd, hd)?
@@ -301,12 +364,12 @@ impl GatedAttention {
         let query = self.q_norm.forward(&query)?.transpose(1, 2)?.contiguous()?;
         let key = self
             .k_proj
-            .forward(x)?
+            .forward(&xh)?
             .reshape((b, l, self.num_kv_heads, hd))?;
         let key = self.k_norm.forward(&key)?.transpose(1, 2)?.contiguous()?;
         let value = self
             .v_proj
-            .forward(x)?
+            .forward(&xh)?
             .reshape((b, l, self.num_kv_heads, hd))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -329,11 +392,49 @@ impl GatedAttention {
 
         // Output gate: sigmoid(gate) (config's output_gate_type is not applied).
         let gated = (ctx * candle_nn::ops::sigmoid(&gate)?)?;
+        let gated = hadamard::apply(&self.out_tf, &gated)?;
         self.o_proj.forward(&gated)
     }
 
     fn clear_state(&mut self) {
         self.kv_cache.reset();
+    }
+}
+
+/// A linear projection that is either Q2MLX-quantized (plain `qwen3_5`) or a
+/// dense F32 weight (`prism_hadamard_qwen35`'s `in_proj_a`/`in_proj_b`, which
+/// are not Hadamard-rotated and are small enough that MLX ships them
+/// unquantized). Detected by the presence of a `.scales` tensor, not by
+/// checkpoint/model type, so either variant loads correctly either way.
+#[derive(Debug, Clone)]
+enum Projection {
+    Quantized(QMatMul),
+    /// Weight already transposed to `[in, out]` and made contiguous at load
+    /// time, so `forward` is a plain `broadcast_matmul`.
+    Dense(Tensor),
+}
+
+impl Projection {
+    fn load(src: &mut SafeTensorsSource<'_>, base: &str) -> Result<Self> {
+        if src.has_tensor(&format!("{base}.scales")) {
+            Ok(Self::Quantized(QMatMul::from_weights(Arc::new(
+                src.load_q2mlx(base)?,
+            ))?))
+        } else {
+            let w = src
+                .plain_tensor(&format!("{base}.weight"))?
+                .to_dtype(DType::F32)?
+                .t()?
+                .contiguous()?;
+            Ok(Self::Dense(w))
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Quantized(q) => q.forward(x),
+            Self::Dense(w) => x.broadcast_matmul(w),
+        }
     }
 }
 
@@ -361,8 +462,8 @@ impl DeltaNetState {
 struct GatedDeltaNet {
     in_proj_qkv: QMatMul,
     in_proj_z: QMatMul,
-    in_proj_a: QMatMul,
-    in_proj_b: QMatMul,
+    in_proj_a: Projection,
+    in_proj_b: Projection,
     out_proj: QMatMul,
     /// Depthwise causal conv taps, `conv_kernel` tensors of shape `(1, conv_dim, 1)`.
     conv_taps: Vec<Tensor>,
@@ -380,10 +481,22 @@ struct GatedDeltaNet {
     conv_dim: usize,
     conv_kernel: usize,
     state: DeltaNetState,
+    /// `prism_hadamard_qwen35` only: rotates the hidden-state input shared by
+    /// `in_proj_qkv`/`in_proj_z` (NOT `in_proj_a`/`in_proj_b`, which consume
+    /// the un-rotated input); `None` for plain `qwen3_5`.
+    in_tf: Option<Arc<HadamardTransform>>,
+    /// `prism_hadamard_qwen35` only: rotates the gated-norm output before
+    /// `out_proj`; `None` for plain `qwen3_5`.
+    out_tf: Option<Arc<HadamardTransform>>,
 }
 
 impl GatedDeltaNet {
-    fn load(src: &mut SafeTensorsSource<'_>, cfg: &Qwen35TextConfig, prefix: &str) -> Result<Self> {
+    fn load(
+        src: &mut SafeTensorsSource<'_>,
+        cfg: &Qwen35TextConfig,
+        prefix: &str,
+        hadamard: &mut Option<HadamardLoader>,
+    ) -> Result<Self> {
         let n_k_heads = cfg.linear_num_key_heads;
         let n_v_heads = cfg.linear_num_value_heads;
         if !n_v_heads.is_multiple_of(n_k_heads) {
@@ -402,16 +515,23 @@ impl GatedDeltaNet {
         let load = |src: &mut SafeTensorsSource<'_>, n: &str| -> Result<QMatMul> {
             QMatMul::from_weights(Arc::new(src.load_q2mlx(&p(n))?))
         };
+        let in_tf = shared_in_transform(
+            hadamard,
+            src,
+            &[p("in_proj_qkv"), p("in_proj_z")],
+            cfg.hidden_size,
+        )?;
+        let out_tf = shared_in_transform(hadamard, src, &[p("out_proj")], value_dim)?;
         let in_proj_qkv = load(src, "in_proj_qkv")?;
         let in_proj_z = load(src, "in_proj_z")?;
-        let in_proj_a = load(src, "in_proj_a")?;
-        let in_proj_b = load(src, "in_proj_b")?;
+        let in_proj_a = Projection::load(src, &p("in_proj_a"))?;
+        let in_proj_b = Projection::load(src, &p("in_proj_b"))?;
         let out_proj = load(src, "out_proj")?;
 
         // conv1d.weight is F16 [conv_dim, conv_kernel, 1] (MLX out,kernel,in).
         // Drop the trailing singleton and split into per-tap (1, conv_dim, 1) F32.
         let conv_w = src
-            .plain_f16(&p("conv1d.weight"))?
+            .plain_tensor(&p("conv1d.weight"))?
             .to_dtype(DType::F32)?
             .reshape((conv_dim, conv_kernel))?;
         let mut conv_taps = Vec::with_capacity(conv_kernel);
@@ -424,9 +544,9 @@ impl GatedDeltaNet {
             );
         }
 
-        let a_log = src.plain_f16(&p("A_log"))?.to_dtype(DType::F32)?;
+        let a_log = src.plain_tensor(&p("A_log"))?.to_dtype(DType::F32)?;
         let a_log_neg_exp = a_log.exp()?.neg()?;
-        let dt_bias = src.plain_f16(&p("dt_bias"))?.to_dtype(DType::F32)?;
+        let dt_bias = src.plain_tensor(&p("dt_bias"))?.to_dtype(DType::F32)?;
         let norm = Qwen35RmsNormGated::load(src, &p("norm.weight"), cfg.rms_norm_eps)?;
 
         Ok(Self {
@@ -448,6 +568,8 @@ impl GatedDeltaNet {
             conv_dim,
             conv_kernel,
             state: DeltaNetState::default(),
+            in_tf,
+            out_tf,
         })
     }
 
@@ -519,8 +641,10 @@ impl GatedDeltaNet {
         let hk = self.k_head_dim;
         let hv = self.v_head_dim;
 
-        let mixed = self.in_proj_qkv.forward(x)?; // (b, l, conv_dim)
-        let z = self.in_proj_z.forward(x)?.reshape((b, l, nv, hv))?;
+        let xh = hadamard::apply(&self.in_tf, x)?;
+        let mixed = self.in_proj_qkv.forward(&xh)?; // (b, l, conv_dim)
+        let z = self.in_proj_z.forward(&xh)?.reshape((b, l, nv, hv))?;
+        // in_proj_a/b are not Hadamard-rotated: they consume the original x.
         let b_proj = self.in_proj_b.forward(x)?; // (b, l, nv)
         let a_proj = self.in_proj_a.forward(x)?; // (b, l, nv)
 
@@ -561,6 +685,7 @@ impl GatedDeltaNet {
             .forward(&core, &z)?
             .reshape((b, l, nv * hv))?
             .to_dtype(x.dtype())?;
+        let normed = hadamard::apply(&self.out_tf, &normed)?;
         self.out_proj.forward(&normed)
     }
 }
@@ -630,16 +755,31 @@ pub struct Qwen35Weights {
     norm: Qwen35RmsNorm,
     lm_head: QMatMul,
     device: Device,
+    /// `prism_hadamard_qwen35` only: un-rotates the gathered embedding rows;
+    /// `None` for plain `qwen3_5`.
+    embed_inv_tf: Option<Arc<HadamardTransform>>,
+    /// `prism_hadamard_qwen35` only: rotates the final hidden state before
+    /// `lm_head`; `None` for plain `qwen3_5`.
+    head_tf: Option<Arc<HadamardTransform>>,
 }
 
 impl Qwen35Weights {
+    /// `hadamard` is `Some` iff `config.json` set `hadamard_config`
+    /// (`prism_hadamard_qwen35`); it is consumed and `HadamardLoader::finish`
+    /// checked once every layer is loaded, so an un-rotated projection the
+    /// manifest expected to be rotated fails loudly instead of silently
+    /// producing wrong activations.
     pub fn from_safetensors(
         src: &mut SafeTensorsSource<'_>,
         cfg: &Qwen35Config,
         device: &Device,
+        hadamard: Option<HadamardManifest>,
     ) -> Result<Self> {
         let tc = &cfg.text_config;
         let eps = tc.rms_norm_eps;
+        let mut hadamard_loader = hadamard
+            .map(|m| HadamardLoader::new(m, device))
+            .transpose()?;
 
         let rotary = Arc::new(RotaryEmbedding::new_unscaled(
             DTYPE,
@@ -654,6 +794,12 @@ impl Qwen35Weights {
         // cast to the F32 compute dtype at use, so this only halves resident memory.
         let embed_qt = src.load_q2mlx("language_model.model.embed_tokens")?;
         let embed_tokens = Embedding::new(embed_qt.dequantize_f16(device)?, tc.hidden_size);
+        let embed_inv_tf = match hadamard_loader.as_mut() {
+            Some(loader) => {
+                loader.inverse_for("language_model.model.embed_tokens", tc.hidden_size, src)?
+            }
+            None => None,
+        };
 
         let mut layers = Vec::with_capacity(tc.num_hidden_layers);
         for i in 0..tc.num_hidden_layers {
@@ -664,17 +810,23 @@ impl Qwen35Weights {
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 eps,
             )?;
-            let mlp = load_mlp(src, &prefix)?;
+            let mlp = load_mlp(src, &prefix, tc, &mut hadamard_loader)?;
             let layer = if (i + 1) % tc.full_attention_interval == 0 {
                 HybridLayer::Full {
-                    attn: GatedAttention::load(src, tc, rotary.clone(), &prefix)?,
+                    attn: GatedAttention::load(
+                        src,
+                        tc,
+                        rotary.clone(),
+                        &prefix,
+                        &mut hadamard_loader,
+                    )?,
                     mlp,
                     ln1,
                     ln2,
                 }
             } else {
                 HybridLayer::Linear {
-                    deltanet: GatedDeltaNet::load(src, tc, &prefix)?,
+                    deltanet: GatedDeltaNet::load(src, tc, &prefix, &mut hadamard_loader)?,
                     mlp,
                     ln1,
                     ln2,
@@ -684,7 +836,15 @@ impl Qwen35Weights {
         }
 
         let norm = Qwen35RmsNorm::load(src, "language_model.model.norm.weight", eps)?;
+        let head_tf = match hadamard_loader.as_mut() {
+            Some(loader) => loader.transform_for("language_model.lm_head", tc.hidden_size, src)?,
+            None => None,
+        };
         let lm_head = QMatMul::from_weights(Arc::new(src.load_q2mlx("language_model.lm_head")?))?;
+
+        if let Some(loader) = hadamard_loader {
+            loader.finish()?;
+        }
 
         Ok(Self {
             embed_tokens,
@@ -692,6 +852,8 @@ impl Qwen35Weights {
             norm,
             lm_head,
             device: device.clone(),
+            embed_inv_tf,
+            head_tf,
         })
     }
 
@@ -716,6 +878,9 @@ impl Qwen35Weights {
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?.to_dtype(DTYPE)?;
+        if let Some(tf) = &self.embed_inv_tf {
+            h = tf.inverse(&h)?;
+        }
         let mask = if l == 1 {
             None
         } else {
@@ -726,6 +891,7 @@ impl Qwen35Weights {
         }
         let h = self.norm.forward(&h)?;
         let last_hidden = h.narrow(1, l - 1, 1)?;
+        let last_hidden = hadamard::apply(&self.head_tf, &last_hidden)?;
         self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
 
@@ -737,10 +903,157 @@ impl Qwen35Weights {
 }
 
 /// Load the SwiGLU MLP projections for a layer from HuggingFace tensor names.
-fn load_mlp(src: &mut SafeTensorsSource<'_>, prefix: &str) -> Result<MlpWeights> {
+fn load_mlp(
+    src: &mut SafeTensorsSource<'_>,
+    prefix: &str,
+    cfg: &Qwen35TextConfig,
+    hadamard: &mut Option<HadamardLoader>,
+) -> Result<MlpWeights> {
     let m = |n: &str| format!("{prefix}.mlp.{n}");
+    let in_tf = shared_in_transform(
+        hadamard,
+        src,
+        &[m("gate_proj"), m("up_proj")],
+        cfg.hidden_size,
+    )?;
+    let down_tf = shared_in_transform(hadamard, src, &[m("down_proj")], cfg.intermediate_size)?;
     let gate_proj = QMatMul::from_weights(Arc::new(src.load_q2mlx(&m("gate_proj"))?))?;
     let up_proj = QMatMul::from_weights(Arc::new(src.load_q2mlx(&m("up_proj"))?))?;
     let down_proj = QMatMul::from_weights(Arc::new(src.load_q2mlx(&m("down_proj"))?))?;
-    Ok(MlpWeights::from_qmatmuls(gate_proj, up_proj, down_proj))
+    Ok(MlpWeights::from_qmatmuls(gate_proj, up_proj, down_proj).with_hadamard(in_tf, down_tf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+    use safetensors::{Dtype, SafeTensors};
+
+    fn build_safetensors(entries: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
+        let views: Vec<(String, TensorView<'_>)> = entries
+            .iter()
+            .map(|(name, dtype, shape, data)| {
+                (
+                    (*name).to_owned(),
+                    TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize(views, None).unwrap()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn projection_dense_forward_matches_matmul() {
+        let device = Device::Cpu;
+        // w: [out=2, in=3], rows [1,2,3] and [4,5,6].
+        let w = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (2, 3), &device).unwrap();
+        let w_t = w.t().unwrap().contiguous().unwrap();
+        let proj = Projection::Dense(w_t);
+        let x = Tensor::from_vec(vec![1f32, 0., 0.], (1, 3), &device).unwrap();
+        let y = proj.forward(&x).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(y, vec![vec![1.0, 4.0]]);
+    }
+
+    fn minimal_hadamard_manifest_json() -> &'static str {
+        r#"{
+            "prism.hadamard.version": 1,
+            "prism.hadamard.block_size": 8,
+            "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
+            "prism.hadamard.axis": "input-last-dimension",
+            "prism.hadamard.sign_mode": "explicit",
+            "prism.hadamard.weight_names": ["a.weight"],
+            "prism.hadamard.inverse_weight_names": [],
+            "prism.hadamard.sign_widths": [8],
+            "prism.hadamard.sign_values": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+        }"#
+    }
+
+    #[test]
+    fn hadamard_loader_finish_errors_on_unclaimed_name() {
+        let device = Device::Cpu;
+        let manifest = HadamardManifest::from_json(minimal_hadamard_manifest_json()).unwrap();
+        let loader = HadamardLoader::new(manifest, &device).unwrap();
+        // "a.weight" is listed in weight_names but transform_for was never called.
+        assert!(loader.finish().is_err());
+    }
+
+    #[test]
+    fn hadamard_loader_transform_for_errors_on_signs_mismatch() {
+        let device = Device::Cpu;
+        let manifest = HadamardManifest::from_json(minimal_hadamard_manifest_json()).unwrap();
+        let mut loader = HadamardLoader::new(manifest, &device).unwrap();
+
+        // "a.signs" disagrees with the manifest's sign vector for width 8
+        // (all +1.0 instead of alternating +-1.0).
+        let buf = build_safetensors(&[("a.signs", Dtype::F32, vec![8], f32_bytes(&[1.0; 8]))]);
+        let st = SafeTensors::deserialize(&buf).unwrap();
+        let src = SafeTensorsSource::new(st, device);
+
+        assert!(loader.transform_for("a", 8, &src).is_err());
+    }
+
+    #[test]
+    fn hadamard_loader_transform_for_succeeds_when_signs_match() {
+        let device = Device::Cpu;
+        let manifest = HadamardManifest::from_json(minimal_hadamard_manifest_json()).unwrap();
+        let mut loader = HadamardLoader::new(manifest, &device).unwrap();
+
+        let buf = build_safetensors(&[(
+            "a.signs",
+            Dtype::F32,
+            vec![8],
+            f32_bytes(&[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]),
+        )]);
+        let st = SafeTensors::deserialize(&buf).unwrap();
+        let src = SafeTensorsSource::new(st, device);
+
+        let tf = loader.transform_for("a", 8, &src).unwrap();
+        assert!(tf.is_some());
+        loader.finish().unwrap();
+    }
+
+    #[test]
+    fn shared_in_transform_errors_when_group_is_partially_rotated() {
+        let device = Device::Cpu;
+        // Only "a.weight" is in weight_names; "b.weight" is not, so a group
+        // sharing one input where only "a" is claimed must bail rather than
+        // silently rotating the input for "b" too (or not rotating for "a").
+        let manifest = HadamardManifest::from_json(minimal_hadamard_manifest_json()).unwrap();
+        let mut hadamard = Some(HadamardLoader::new(manifest, &device).unwrap());
+
+        let buf = build_safetensors(&[(
+            "a.signs",
+            Dtype::F32,
+            vec![8],
+            f32_bytes(&[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]),
+        )]);
+        let st = SafeTensors::deserialize(&buf).unwrap();
+        let src = SafeTensorsSource::new(st, device);
+
+        let bases = vec!["a".to_owned(), "b".to_owned()];
+        let result = shared_in_transform(&mut hadamard, &src, &bases, 8);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn shared_in_transform_ok_when_group_fully_unrotated() {
+        let device = Device::Cpu;
+        // Neither "x" nor "y" is in weight_names: the whole group is
+        // legitimately un-rotated (e.g. a plain qwen3_5 checkpoint with no
+        // hadamard manifest at all, or a group the manifest doesn't cover).
+        let manifest = HadamardManifest::from_json(minimal_hadamard_manifest_json()).unwrap();
+        let mut hadamard = Some(HadamardLoader::new(manifest, &device).unwrap());
+
+        let buf = build_safetensors(&[("unused", Dtype::F32, vec![1], f32_bytes(&[0.0]))]);
+        let st = SafeTensors::deserialize(&buf).unwrap();
+        let src = SafeTensorsSource::new(st, device);
+
+        let bases = vec!["x".to_owned(), "y".to_owned()];
+        let result = shared_in_transform(&mut hadamard, &src, &bases, 8).unwrap();
+        assert!(result.is_none());
+    }
 }

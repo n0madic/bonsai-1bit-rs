@@ -20,9 +20,13 @@ Important constraints:
   - GGUF dtype `Q1_0_g128` — binary {−d, +d}, 1 bit/weight, block 128 (CPU + Metal)
   - runtime-only dtype `Q2MLX` — MLX 2-bit affine `w = scale·q + bias`
     (q ∈ {0,1,2,3}), group 128, loaded from MLX safetensors (CPU + Metal)
+  - the Hadamard rotation used by `prism_hadamard_qwen35` (`Ternary-Bonsai-2-27B`)
+    is **not** a third `GgmlDType` — it is an activation-side transform
+    (`crates/bonsai-candle/src/hadamard.rs`) applied before/after the `Q2MLX`
+    matmul; the packed weight format underneath is unchanged Q2MLX
 - architectures: Qwen3 with YaRN rope scaling (GGUF + `Ternary-Bonsai-8B`), and
-  the Qwen3.5 hybrid (`qwen3_5`, `Ternary-Bonsai-27B`) — text-only, dispatched by
-  `config.json` `model_type`
+  the Qwen3.5 hybrid (`qwen3_5`, `Ternary-Bonsai-27B`; `prism_hadamard_qwen35`,
+  `Ternary-Bonsai-2-27B`) — text-only, dispatched by `config.json` `model_type`
 
 ## Workspace Layout
 
@@ -37,6 +41,7 @@ Important constraints:
   - owns model loading, prompt rendering, token streaming, sampling, repeat control, and generation stats
   - contains the Qwen3/Bonsai model implementation with YaRN rope scaling (`src/qwen3.rs`)
   - contains the Qwen3.5 hybrid implementation (`src/qwen3_5.rs`)
+  - contains the Hadamard-rotation activation transform for `prism_hadamard_qwen35` (`src/hadamard.rs`)
   - contains `ConcatKvCache` (`src/kv_cache.rs`) and `LogitsProcessor`/`Sampling` (`src/generation.rs`)
 - `crates/bonsai-cli`
   - CLI wrapper over `bonsai-candle`
@@ -66,7 +71,8 @@ Main responsibilities:
 Local modules (not from candle-transformers):
 
 - `src/qwen3.rs` — quantized Qwen3 model with YaRN rope scaling; adapted from candle-transformers with extended context support
-- `src/qwen3_5.rs` — Qwen3.5 hybrid (`qwen3_5`) text stack: Gated DeltaNet linear-attention + gated full-attention, loaded from MLX `Q2MLX` safetensors
+- `src/qwen3_5.rs` — Qwen3.5 hybrid (`qwen3_5` / `prism_hadamard_qwen35`) text stack: Gated DeltaNet linear-attention + gated full-attention, loaded from MLX `Q2MLX` safetensors
+- `src/hadamard.rs` — blockwise normalized Sylvester Walsh–Hadamard transform (`prism_hadamard_qwen35` activation rotation) and its `hadamard.json` manifest parser/loader
 - `src/kv_cache.rs` — `ConcatKvCache` using `Tensor::cat` for Metal/CUDA-optimized KV cache
 - `src/generation.rs` — `LogitsProcessor` and `Sampling` enum (ArgMax, All, TopK, TopP, TopKThenTopP)
 
@@ -195,6 +201,55 @@ Non-obvious details verified against the `transformers` `models/qwen3_5` referen
 The per-token recurrence is sequential, so 27B throughput is well below the
 plain-attention models; chunked prefill is a future optimization.
 
+### Hadamard-rotated variant (`prism_hadamard_qwen35`, `Ternary-Bonsai-2-27B`)
+
+Same text topology as `qwen3_5` (`base_model_type = "qwen3_5"` in `config.json`,
+byte-identical `text_config` besides `eos_token_id`/`mtp_num_hidden_layers`), but
+every packed linear/embedding weight is quantized in a basis rotated by a
+blockwise (block 1024) normalized Sylvester Walsh–Hadamard transform. `lib.rs`
+dispatches both `"qwen3_5"` and `"prism_hadamard_qwen35"` `model_type` values to
+`Qwen35Weights`; the manifest named by `config.json`'s `hadamard_config`
+(`hadamard.json`) is parsed by `HadamardManifest::from_json` and required when
+`model_type == "prism_hadamard_qwen35"`.
+
+- **Transform**: `HadamardTransform::forward` = `(x * signs) @ (H_1024 / sqrt(1024))`;
+  `::inverse` = `(x @ (H_1024 / sqrt(1024))) * signs` — signs-then-rotate forward,
+  rotate-then-signs inverse. Getting this order backwards produces wrong (but
+  still tensor-shaped) output, not a crash.
+- **Sign vectors** are keyed by input width, not by tensor: 5120 (hidden state),
+  6144 (mixer output: `o_proj`/`out_proj` input), 17408 (FFN-down input,
+  `intermediate_size`). `HadamardLoader` cross-checks each tensor's `.signs`
+  safetensors entry against the manifest's vector for that width rather than
+  trusting either source alone.
+- **Shared rotated inputs**: the transform is computed once per consumer group
+  and reused — q/k/v share `ln1(x)`'s rotation, `in_proj_qkv`/`in_proj_z` share
+  the DeltaNet input's rotation, `gate_proj`/`up_proj` share the MLP input's
+  rotation — via `shared_in_transform` in `qwen3_5.rs`, not recomputed per
+  projection.
+- **`in_proj_a`/`in_proj_b` are NOT Hadamard-rotated.** They are also no longer
+  Q2MLX in this checkpoint — they ship as plain dense F32 `[n_v_heads, hidden_size]`
+  weights, detected by the *absence* of a `.scales` tensor (`Projection::load` in
+  `qwen3_5.rs`), not by model type, so an old `qwen3_5` checkpoint (where they are
+  still Q2MLX) keeps working unchanged. Both variants consume the **un-rotated**
+  layer input — only `in_proj_qkv`/`in_proj_z` see the rotated input.
+- **Small tensors are F32, not F16**: `input_layernorm`, `post_attention_layernorm`,
+  `linear_attn.norm`, `q_norm`/`k_norm`, `A_log`, `dt_bias`, `conv1d.weight`,
+  `model.norm` — the RMSNorm `+1` fold still applies (values still centered at
+  ~1, not ~0). `SafeTensorsSource::plain_tensor` reads the real safetensors dtype
+  instead of assuming F16 (the old `plain_f16` would silently misread or fail on
+  these).
+- **`eos_token_id` trap**: `text_config.eos_token_id = 248044` is `<|endoftext|>`
+  (== bos); the real turn-end token `<|im_end|>` (248046) is only in
+  `generation_config.json`. `lib.rs::read_generation_config_eos` takes priority
+  over `config.json`'s value for both `qwen3_5` and `prism_hadamard_qwen35`
+  checkpoints (harmless where they already agree).
+- **Load-time completeness check**: `HadamardLoader::finish` errors if any
+  `hadamard.json` `weight_names`/`inverse_weight_names` entry was never claimed
+  by a loaded tensor — catches a future checkpoint variant that rotates a
+  different set of projections instead of silently under-rotating.
+- Vision tower tensors are present in the checkpoint but ignored, same as plain
+  `qwen3_5`; there are no MTP tensors (`mtp_num_hidden_layers = 0`).
+
 ### Chat template compatibility
 
 Library file:
@@ -289,6 +344,7 @@ Minimal `messages.json` shape:
 - if you touch quantized loading or matmul, verify both CPU and Metal code paths
 - if you touch `src/qwen3.rs`, remember it is not the candle-transformers version — it is a local copy with YaRN
 - if you touch `src/qwen3_5.rs`, cross-check the recurrence/conv/gate math against the `transformers` `models/qwen3_5` reference, and remember the MLX RMSNorm weights already include the `+1` (do not re-add it)
+- if you touch `src/hadamard.rs` or the `prism_hadamard_qwen35` wiring in `src/qwen3_5.rs`, verify against `runtime/runtime.py`'s `fwht()` in the checkpoint's bundled runtime (forward = signs then rotate; inverse = rotate then signs), and confirm `in_proj_a`/`in_proj_b` still receive the un-rotated input
 - if you touch prompt rendering, verify both:
   - `--template-mode strict`
   - `--template-mode warn-fallback`
@@ -302,6 +358,8 @@ Minimal `messages.json` shape:
 - Metal kernel name mapping between Rust and `.metal` code
 - YaRN rope scaling metadata parsing in `src/qwen3.rs`
 - `qwen3_5` RMSNorm weight handling (the MLX `+1` fold), the `sigmoid` output gate, the DeltaNet query `1/sqrt(head_dim)` scale, and the conv1d tap order
+- `prism_hadamard_qwen35` transform order: signs-then-Hadamard forward, Hadamard-then-signs inverse — swapping these silently corrupts output instead of erroring
+- `prism_hadamard_qwen35` `in_proj_a`/`in_proj_b` must see the un-rotated layer input, not `ln1(x)`'s rotated form used by `in_proj_qkv`/`in_proj_z`
 - prompt rendering when the GGUF chat template uses Python-like string methods
 - token streaming if buffering changes suppress intermediate flushes
 - stats if timing starts after the first generated token

@@ -1,9 +1,11 @@
 mod generation;
+mod hadamard;
 mod kv_cache;
 mod qwen3;
 mod qwen3_5;
 
 use crate::generation::{LogitsProcessor, Sampling};
+use crate::hadamard::HadamardManifest;
 use crate::qwen3::{ModelWeights, Qwen3Config, SafeTensorsSource};
 use crate::qwen3_5::{Qwen35Config, Qwen35Weights};
 use anyhow::{anyhow, bail, Context, Result};
@@ -27,6 +29,57 @@ use tokenizers::Tokenizer;
 struct ModelTypeProbe {
     #[serde(default)]
     model_type: Option<String>,
+}
+
+/// `eos_token_id` in `generation_config.json` can be a single id or a list;
+/// HF semantics is that generation stops when the sampled token matches ANY
+/// id in the list, not just the first one.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EosTokenIdField {
+    Single(u32),
+    Multiple(Vec<u32>),
+}
+
+impl EosTokenIdField {
+    fn into_vec(self) -> Vec<u32> {
+        match self {
+            Self::Single(id) => vec![id],
+            Self::Multiple(ids) => ids,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerationConfigProbe {
+    #[serde(default)]
+    eos_token_id: Option<EosTokenIdField>,
+}
+
+/// Reads `eos_token_id` from `generation_config.json` if present, as the full
+/// set of stop ids (not just the first). Some checkpoints only put the real
+/// turn-end token here, leaving `config.json`'s `eos_token_id` set to a
+/// different special token (see `load_from_hf_dir`).
+///
+/// `generation_config.json` is an optional, auxiliary file: a missing or
+/// unparseable one falls back to `config.json`/the tokenizer's `<|im_end|>`
+/// rather than failing the whole model load, so a malformed file only
+/// degrades EOS detection instead of blocking loading outright. The warning
+/// is printed to stderr since `load_from_hf_dir` has no other channel to
+/// surface load-time warnings.
+fn read_generation_config_eos(dir: &Path) -> Option<Vec<u32>> {
+    let path = dir.join("generation_config.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<GenerationConfigProbe>(&content) {
+        Ok(probe) => probe.eos_token_id.map(EosTokenIdField::into_vec),
+        Err(err) => {
+            eprintln!(
+                "warning: failed to parse {}: {err}; falling back to config.json/tokenizer for eos_token_id",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +223,9 @@ pub struct BonsaiModel {
     tokenizer: Tokenizer,
     prompt_formatter: PromptFormatter,
     device: candle::Device,
-    eos_token_id: Option<u32>,
+    /// Any sampled token matching one of these ids stops generation (HF
+    /// semantics: `eos_token_id` may be a list, and any entry can end a turn).
+    eos_token_ids: Vec<u32>,
     max_seq_len: usize,
 }
 
@@ -210,10 +265,35 @@ impl BonsaiModel {
             .map_err(|e| anyhow!("failed to parse safetensors: {e}"))?;
         let mut src = SafeTensorsSource::new(st, device.clone());
 
-        let (model, config_eos, max_seq_len) = if probe.model_type.as_deref() == Some("qwen3_5") {
+        let (model, config_eos, max_seq_len) = if matches!(
+            probe.model_type.as_deref(),
+            Some("qwen3_5") | Some("prism_hadamard_qwen35")
+        ) {
             let cfg: Qwen35Config = serde_json::from_str(&cfg_str)
                 .with_context(|| format!("failed to parse {}", cfg_path.display()))?;
-            let model = Qwen35Weights::from_safetensors(&mut src, &cfg, &device)
+            let hadamard = match &cfg.hadamard_config {
+                Some(name) => {
+                    let hadamard_path = dir.join(name);
+                    let hadamard_str = std::fs::read_to_string(&hadamard_path)
+                        .with_context(|| format!("failed to read {}", hadamard_path.display()))?;
+                    let manifest = HadamardManifest::from_json(&hadamard_str)
+                        .with_context(|| format!("failed to parse {}", hadamard_path.display()))?;
+                    manifest
+                        .assert_gdn_layout_supported(
+                            cfg.text_config.linear_num_value_heads,
+                            cfg.text_config.linear_num_key_heads,
+                        )
+                        .with_context(|| {
+                            format!("{}: unsupported checkpoint layout", hadamard_path.display())
+                        })?;
+                    Some(manifest)
+                }
+                None => None,
+            };
+            if probe.model_type.as_deref() == Some("prism_hadamard_qwen35") && hadamard.is_none() {
+                bail!("prism_hadamard_qwen35 requires hadamard_config in config.json");
+            }
+            let model = Qwen35Weights::from_safetensors(&mut src, &cfg, &device, hadamard)
                 .context("failed to load Bonsai qwen3_5 weights from MLX safetensors")?;
             let max_seq_len = cfg.max_position_embeddings();
             (Model::Qwen35(model), cfg.eos_token_id(), max_seq_len)
@@ -229,10 +309,24 @@ impl BonsaiModel {
             )
         };
 
-        let eos_token_id =
-            config_eos.or_else(|| tokenizer.get_vocab(true).get("<|im_end|>").copied());
-        let eos_token_str = eos_token_id
-            .and_then(|id| tokenizer.id_to_token(id))
+        // `generation_config.json`'s `eos_token_id` takes priority: some
+        // checkpoints (e.g. Ternary-Bonsai-2-27B) set `config.json`'s
+        // `eos_token_id` to `<|endoftext|>` (== bos) and only list the real
+        // turn-end token (`<|im_end|>`) here. Any id in the (possibly
+        // multi-element) result stops generation.
+        let eos_token_ids: Vec<u32> = read_generation_config_eos(dir)
+            .or_else(|| config_eos.map(|id| vec![id]))
+            .or_else(|| {
+                tokenizer
+                    .get_vocab(true)
+                    .get("<|im_end|>")
+                    .copied()
+                    .map(|id| vec![id])
+            })
+            .unwrap_or_default();
+        let eos_token_str = eos_token_ids
+            .first()
+            .and_then(|&id| tokenizer.id_to_token(id))
             .unwrap_or_default();
 
         let template_path = dir.join("chat_template.jinja");
@@ -245,7 +339,7 @@ impl BonsaiModel {
             tokenizer,
             prompt_formatter,
             device,
-            eos_token_id,
+            eos_token_ids,
             max_seq_len,
         })
     }
@@ -260,8 +354,10 @@ impl BonsaiModel {
         let tokenizer =
             Tokenizer::from_gguf(&content).context("failed to build tokenizer from GGUF")?;
         let prompt_formatter = PromptFormatter::from_gguf(&content);
-        let eos_token_id = metadata_u32(&content, "tokenizer.ggml.eos_token_id")
-            .or_else(|| tokenizer.get_vocab(true).get("<|im_end|>").copied());
+        let eos_token_ids: Vec<u32> = metadata_u32(&content, "tokenizer.ggml.eos_token_id")
+            .or_else(|| tokenizer.get_vocab(true).get("<|im_end|>").copied())
+            .into_iter()
+            .collect();
         let max_seq_len = metadata_u32(&content, "qwen3.context_length")
             .map(|v| v as usize)
             .unwrap_or(usize::MAX);
@@ -272,7 +368,7 @@ impl BonsaiModel {
             tokenizer,
             prompt_formatter,
             device,
-            eos_token_id,
+            eos_token_ids,
             max_seq_len,
         })
     }
@@ -381,7 +477,7 @@ impl BonsaiModel {
         }
 
         for step in 1..max_new_tokens {
-            if Some(next_token) == self.eos_token_id {
+            if self.eos_token_ids.contains(&next_token) {
                 break;
             }
 
@@ -883,6 +979,68 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// A directory under the system temp dir, unique per test, deleted on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "bonsai-candle-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn generation_config_eos_reads_scalar_form() {
+        let dir = TempDir::new("eos-scalar");
+        std::fs::write(
+            dir.0.join("generation_config.json"),
+            r#"{"bos_token_id": 248044, "eos_token_id": 248046}"#,
+        )
+        .unwrap();
+        assert_eq!(read_generation_config_eos(&dir.0), Some(vec![248046]));
+    }
+
+    #[test]
+    fn generation_config_eos_reads_list_form_keeps_all_ids() {
+        let dir = TempDir::new("eos-list");
+        std::fs::write(
+            dir.0.join("generation_config.json"),
+            r#"{"eos_token_id": [248046, 248044]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_generation_config_eos(&dir.0),
+            Some(vec![248046, 248044])
+        );
+    }
+
+    #[test]
+    fn generation_config_eos_missing_file_returns_none() {
+        let dir = TempDir::new("eos-missing");
+        assert_eq!(read_generation_config_eos(&dir.0), None);
+    }
+
+    #[test]
+    fn generation_config_eos_malformed_file_warns_and_returns_none() {
+        let dir = TempDir::new("eos-malformed");
+        std::fs::write(dir.0.join("generation_config.json"), "not json").unwrap();
+        assert_eq!(read_generation_config_eos(&dir.0), None);
+    }
 
     #[test]
     fn repeat_context_includes_prompt_tail_and_generated_tokens() {

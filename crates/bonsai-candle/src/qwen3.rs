@@ -91,16 +91,32 @@ impl<'a> SafeTensorsSource<'a> {
         Ok(view.shape().to_vec())
     }
 
-    /// Load a plain (non-quantized) F16 tensor by its exact safetensors name,
+    /// Whether the underlying safetensors file has a tensor with this exact
+    /// name (no GGUF-name translation).
+    pub(crate) fn has_tensor(&self, name: &str) -> bool {
+        self.st.tensor(name).is_ok()
+    }
+
+    /// Load a plain (non-quantized) tensor by its exact safetensors name,
     /// bypassing the GGUF-name `translate` map. Used by the qwen3_5 loader for
     /// tensors that have no GGUF-name equivalent (conv1d weight, A_log, dt_bias,
-    /// gated-norm weight, and the RMSNorm weights). Note the MLX conversion folds
-    /// the `+1` of the reference `(1 + weight)` RMSNorm into the stored weights,
-    /// so callers apply these weights as-is (do not add `1` again).
-    pub(crate) fn plain_f16(&self, name: &str) -> Result<Tensor> {
-        let bytes = self.tensor_bytes(name)?;
-        let shape = self.tensor_shape(name)?;
-        Tensor::from_raw_buffer(bytes, DType::F16, &shape, &self.device)
+    /// gated-norm weight, RMSNorm weights, and — for `prism_hadamard_qwen35`
+    /// checkpoints — the per-width `.signs` vectors and the dense `in_proj_a/b`
+    /// weights). Note the MLX conversion folds the `+1` of the reference
+    /// `(1 + weight)` RMSNorm into the stored weights, so callers apply these
+    /// weights as-is (do not add `1` again).
+    pub(crate) fn plain_tensor(&self, name: &str) -> Result<Tensor> {
+        let view = self
+            .st
+            .tensor(name)
+            .map_err(|e| candle::Error::msg(anyhow!("missing tensor {name}: {e}")))?;
+        let dtype = match view.dtype() {
+            safetensors::Dtype::F16 => DType::F16,
+            safetensors::Dtype::F32 => DType::F32,
+            safetensors::Dtype::BF16 => DType::BF16,
+            other => candle::bail!("{name}: unsupported plain tensor dtype {other:?}"),
+        };
+        Tensor::from_raw_buffer(view.data(), dtype, view.shape(), &self.device)
     }
 
     /// Load a quantized projection encoded as `<base>.{weight,scales,biases}`
@@ -279,6 +295,12 @@ pub(crate) struct MlpWeights {
     up_proj: QMatMul,
     down_proj: QMatMul,
     act_fn: Activation,
+    /// `prism_hadamard_qwen35` only: Hadamard-rotate the hidden-state input
+    /// before `gate_proj`/`up_proj`; `None` for every other checkpoint.
+    in_tf: Option<Arc<crate::hadamard::HadamardTransform>>,
+    /// `prism_hadamard_qwen35` only: Hadamard-rotate `silu(gate) * up` before
+    /// `down_proj`; `None` for every other checkpoint.
+    down_tf: Option<Arc<crate::hadamard::HadamardTransform>>,
     span: tracing::Span,
 }
 
@@ -293,8 +315,22 @@ impl MlpWeights {
             up_proj,
             down_proj,
             act_fn: Activation::Silu,
+            in_tf: None,
+            down_tf: None,
             span,
         }
+    }
+
+    /// Attach the Hadamard transforms used by `prism_hadamard_qwen35`
+    /// checkpoints. No-op (transforms stay `None`) for plain `qwen3_5`.
+    pub(crate) fn with_hadamard(
+        mut self,
+        in_tf: Option<Arc<crate::hadamard::HadamardTransform>>,
+        down_tf: Option<Arc<crate::hadamard::HadamardTransform>>,
+    ) -> Self {
+        self.in_tf = in_tf;
+        self.down_tf = down_tf;
+        self
     }
 
     fn new(src: &mut dyn WeightSource, prefix: &str) -> Result<Self> {
@@ -308,6 +344,8 @@ impl MlpWeights {
             up_proj,
             down_proj,
             act_fn,
+            in_tf: None,
+            down_tf: None,
             span,
         })
     }
@@ -316,9 +354,11 @@ impl MlpWeights {
 impl Module for MlpWeights {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?;
-        let up = self.up_proj.forward(x)?;
+        let xh = crate::hadamard::apply(&self.in_tf, x)?;
+        let gate = self.gate_proj.forward(&xh)?.apply(&self.act_fn)?;
+        let up = self.up_proj.forward(&xh)?;
         let gated = (gate * up)?;
+        let gated = crate::hadamard::apply(&self.down_tf, &gated)?;
         self.down_proj.forward(&gated)
     }
 }
@@ -946,5 +986,60 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+    use safetensors::Dtype;
+
+    fn build_safetensors(entries: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
+        let views: Vec<(String, TensorView<'_>)> = entries
+            .iter()
+            .map(|(name, dtype, shape, data)| {
+                (
+                    (*name).to_owned(),
+                    TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize(views, None).unwrap()
+    }
+
+    #[test]
+    fn plain_tensor_reads_f16_and_f32_by_exact_dtype() {
+        let f16_bytes = f16::from_f32(1.5).to_le_bytes().to_vec();
+        let f32_bytes = 2.5f32.to_le_bytes().to_vec();
+        let buf = build_safetensors(&[
+            ("a", Dtype::F16, vec![1], f16_bytes),
+            ("b", Dtype::F32, vec![1], f32_bytes),
+        ]);
+        let st = SafeTensors::deserialize(&buf).unwrap();
+        let src = SafeTensorsSource::new(st, Device::Cpu);
+
+        assert!(src.has_tensor("a"));
+        assert!(src.has_tensor("b"));
+        assert!(!src.has_tensor("missing"));
+
+        let a = src.plain_tensor("a").unwrap();
+        assert_eq!(a.dtype(), DType::F16);
+        assert_eq!(
+            a.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.5]
+        );
+
+        let b = src.plain_tensor("b").unwrap();
+        assert_eq!(b.dtype(), DType::F32);
+        assert_eq!(b.to_vec1::<f32>().unwrap(), vec![2.5]);
+    }
+
+    #[test]
+    fn plain_tensor_errors_on_missing_name() {
+        let buf = build_safetensors(&[("a", Dtype::F32, vec![1], 1.0f32.to_le_bytes().to_vec())]);
+        let st = SafeTensors::deserialize(&buf).unwrap();
+        let src = SafeTensorsSource::new(st, Device::Cpu);
+        assert!(src.plain_tensor("missing").is_err());
     }
 }

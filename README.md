@@ -10,6 +10,7 @@ Native Rust inference for [Bonsai](https://prismml.com) models — ultra-low-bit
 | Bonsai-8B | GGUF `Q1_0_g128` | ~1 GB | 1-bit binary {−d, +d}, block 128 |
 | Ternary-Bonsai-8B | MLX safetensors `Q2MLX` | 2.15 GiB | Ternary 1.58-bit, 75.5 avg benchmark |
 | Ternary-Bonsai-27B | MLX safetensors `Q2MLX` | 8.49 GiB | Qwen3.5 hybrid (Gated DeltaNet + gated full attention), text-only |
+| Ternary-Bonsai-2-27B | MLX safetensors `Q2MLX` + Hadamard | 8.6 GiB | `prism_hadamard_qwen35`: same Qwen3.5 hybrid topology, but Q2MLX weights are quantized in a Hadamard-rotated basis, text-only |
 
 Both quantization formats are custom extensions — `Q1_0_g128` and `Q2MLX` are not part of upstream Candle and are applied via vendored patches to `candle-core` and `candle-metal-kernels`.
 
@@ -19,6 +20,9 @@ Both quantization formats are custom extensions — `Q1_0_g128` and `Q2MLX` are 
 - macOS with Apple Silicon for Metal acceleration (CPU works on any platform)
 - For GGUF models: `Bonsai-1.7B.gguf` or `Bonsai-8B.gguf`
 - For MLX models: a directory with `config.json`, `model.safetensors`, `tokenizer.json`, `chat_template.jinja`
+  - `prism_hadamard_qwen35` checkpoints (Ternary-Bonsai-2-27B) additionally need `hadamard.json`
+    (named by `config.json`'s `hadamard_config`); `generation_config.json` is read if present
+    and takes priority for `eos_token_id`
 
 ## Build
 
@@ -40,6 +44,9 @@ bonsai-cli --model Ternary-Bonsai-8B-mlx-2bit --device metal --prompt "Hello!"
 
 # Qwen3.5 hybrid 27B (MLX directory, Metal, text-only)
 bonsai-cli --model Ternary-Bonsai-27B-mlx-2bit --device metal --prompt "Hello!"
+
+# Qwen3.5 hybrid 27B v2, Hadamard-rotated Q2MLX (MLX directory, Metal, text-only)
+bonsai-cli --model Ternary-Bonsai-2-27B-mlx-2bit --device metal --prompt "Hello!"
 
 # Multi-turn conversation from a JSON file
 bonsai-cli --model Bonsai-8B.gguf --messages-file messages.json
@@ -94,6 +101,7 @@ bonsai-1bit-rs/
 │   │       ├── lib.rs         # public API: BonsaiModel, GenerateOptions, model dispatch
 │   │       ├── qwen3.rs       # quantized Qwen3 with YaRN rope scaling
 │   │       ├── qwen3_5.rs     # Qwen3.5 hybrid (Gated DeltaNet + gated attention), text-only
+│   │       ├── hadamard.rs    # blockwise Hadamard rotation (prism_hadamard_qwen35)
 │   │       ├── kv_cache.rs    # ConcatKvCache (Tensor::cat based)
 │   │       └── generation.rs  # LogitsProcessor, Sampling enum
 │   └── bonsai-cli/      # CLI wrapper
@@ -127,6 +135,22 @@ ignored, so inference is text-only. The DeltaNet recurrence and its depthwise ca
 convolution run as an explicit per-token scan (shared by prefill and decode), which is
 correct but sequential, so throughput is lower than the plain-attention Qwen3 models;
 chunked prefill is a possible future optimization.
+
+### Hadamard-rotated Q2MLX (`Ternary-Bonsai-2-27B`)
+
+`Ternary-Bonsai-2-27B` (`model_type = prism_hadamard_qwen35`) is the same Qwen3.5 hybrid
+topology as `Ternary-Bonsai-27B`, but every packed linear/embedding weight is quantized
+in a *rotated* basis: activations are passed through a blockwise (block 1024) normalized
+Sylvester Walsh–Hadamard transform — sign flip then Hadamard rotation for linear inputs,
+Hadamard rotation then sign flip for the embedding output — before/after they meet the
+Q2MLX matmul (`crates/bonsai-candle/src/hadamard.rs`). The rotation is implemented as a
+dense `H_1024 / 32` matmul (plain Candle ops, no vendor/kernel changes), applied once per
+shared consumer group per layer (hidden state, mixer output, FFN-down input) rather than
+once per projection. The dense `in_proj_a`/`in_proj_b` DeltaNet gates are not rotated and
+are loaded as plain F32 weights instead of Q2MLX. `hadamard.json` is validated at load
+time and every manifest-listed weight name must be claimed by a loaded tensor, so a
+checkpoint variant that silently changes which projections are rotated fails to load
+instead of producing wrong output.
 
 ## License
 
