@@ -134,6 +134,10 @@ Patched files:
 - `vendor/candle/candle-core/src/quantized/metal.rs`
 - `vendor/candle/candle-metal-kernels/src/metal_src/quantized.metal`
 - `vendor/candle/candle-metal-kernels/src/kernels/quantized.rs`
+- `vendor/candle/candle-metal-kernels/src/metal_src/hadamard.metal` (new)
+- `vendor/candle/candle-metal-kernels/src/kernels/hadamard.rs` (new)
+- `vendor/candle/candle-metal-kernels/src/{source.rs,kernel.rs,kernels/mod.rs,lib.rs}`
+  (register `Source::Hadamard`)
 
 What these patches do:
 
@@ -148,6 +152,11 @@ What these patches do:
   `dequantize_q2_mlx` + `kernel_mul_mv_q2_mlx_f32` + template instantiation
   `kernel_mul_mm_q2_mlx_f32`. Constructed from MLX safetensors via
   `QStorage::from_data(..., GgmlDType::Q2MLX)`; has no GGUF id.
+- add Metal kernel `hadamard_block_fwht_f32` (`call_hadamard_block_fwht`):
+  fused sign flip + blockwise normalized natural-order FWHT, one threadgroup
+  per block staged in threadgroup memory (block <= `HADAMARD_MAX_BLOCK` =
+  8192). Used by `bonsai-candle`'s `prism_hadamard_qwen35` rotation; not a
+  quantization format.
 
 Important rule:
 
@@ -216,6 +225,16 @@ dispatches both `"qwen3_5"` and `"prism_hadamard_qwen35"` `model_type` values to
   `::inverse` = `(x @ (H_1024 / sqrt(1024))) * signs` — signs-then-rotate forward,
   rotate-then-signs inverse. Getting this order backwards produces wrong (but
   still tensor-shaped) output, not a crash.
+- **Implementation**: no dense `H_1024` is ever built at runtime. Both directions
+  run the `BlockFwht` `CustomOp2` on `(x, signs)`: sign flip, natural-order
+  (strides `1, 2, 4, ...`) unnormalized butterfly, and the `1/sqrt(block)` scale
+  fused in one pass — CPU via rayon over blocks, Metal via
+  `hadamard_block_fwht_f32` (reads `x` in place at its layout offset, writes one
+  output buffer). Signs are indexed by position within the row
+  (`signs[(chunk % (width / block)) * block + i]`). F32 only; the input's last
+  dim must equal the sign vector width. Tests keep the old dense matmul as the
+  convention oracle; benchmark with
+  `cargo test --release -p bonsai-candle hadamard_bench -- --ignored --nocapture`.
 - **Sign vectors** are keyed by input width, not by tensor: 5120 (hidden state),
   6144 (mixer output: `o_proj`/`out_proj` input), 17408 (FFN-down input,
   `intermediate_size`). `HadamardLoader` cross-checks each tensor's `.signs`
@@ -359,6 +378,7 @@ Minimal `messages.json` shape:
 - YaRN rope scaling metadata parsing in `src/qwen3.rs`
 - `qwen3_5` RMSNorm weight handling (the MLX `+1` fold), the `sigmoid` output gate, the DeltaNet query `1/sqrt(head_dim)` scale, and the conv1d tap order
 - `prism_hadamard_qwen35` transform order: signs-then-Hadamard forward, Hadamard-then-signs inverse — swapping these silently corrupts output instead of erroring
+- `prism_hadamard_qwen35` per-row sign indexing in `BlockFwht` / `hadamard.metal`: chunk `c` uses `signs[(c % (width / block)) * block ..]` — indexing by the absolute chunk or clamping silently corrupts every row after the first
 - `prism_hadamard_qwen35` `in_proj_a`/`in_proj_b` must see the un-rotated layer input, not `ln1(x)`'s rotated form used by `in_proj_qkv`/`in_proj_z`
 - prompt rendering when the GGUF chat template uses Python-like string methods
 - token streaming if buffering changes suppress intermediate flushes

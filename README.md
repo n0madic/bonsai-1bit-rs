@@ -143,8 +143,9 @@ topology as `Ternary-Bonsai-27B`, but every packed linear/embedding weight is qu
 in a *rotated* basis: activations are passed through a blockwise (block 1024) normalized
 Sylvester Walsh–Hadamard transform — sign flip then Hadamard rotation for linear inputs,
 Hadamard rotation then sign flip for the embedding output — before/after they meet the
-Q2MLX matmul (`crates/bonsai-candle/src/hadamard.rs`). The rotation is implemented as a
-dense `H_1024 / 32` matmul (plain Candle ops, no vendor/kernel changes), applied once per
+Q2MLX matmul (`crates/bonsai-candle/src/hadamard.rs`). The rotation is a fused sign flip +
+O(n log n) butterfly FWHT (a Candle custom op: rayon-parallel CPU path, and a dedicated
+`hadamard_block_fwht_f32` Metal kernel in the vendored `candle-metal-kernels`), applied once per
 shared consumer group per layer (hidden state, mixer output, FFN-down input) rather than
 once per projection. The dense `in_proj_a`/`in_proj_b` DeltaNet gates are not rotated and
 are loaded as plain F32 weights instead of Q2MLX. `hadamard.json` is validated at load

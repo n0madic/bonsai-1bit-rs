@@ -192,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
  "half",
@@ -200,6 +201,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "rand",
+ "rayon",
  "safetensors",
  "serde",
  "serde_json",

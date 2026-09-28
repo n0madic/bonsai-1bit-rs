@@ -11,6 +11,7 @@ candle-transformers = { workspace = true }
 half = { workspace = true }
 memmap2 = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 safetensors = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
@@ -22,5 +23,6 @@ tokenizers = { workspace = true, features = ["onig"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle = { workspace = true, features = ["metal"] }
+candle-metal-kernels = { workspace = true }
 candle-nn = { workspace = true, features = ["metal"] }
 candle-transformers = { workspace = true, features = ["metal"] }
